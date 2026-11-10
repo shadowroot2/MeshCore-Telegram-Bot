@@ -20,11 +20,13 @@ run: build
 docker-build:
 	docker build -f docker/Dockerfile -t meshcore-telegram-bot .
 
+# --project-directory . : compose ожидает .env рядом с собой, а в репозитории
+# он лежит в корне (как на Synology — рядом с docker-compose.yml).
 docker-up:
-	docker compose -f docker/docker-compose.yml up -d
+	docker compose --project-directory . -f docker/docker-compose.yml up -d
 
 docker-down:
-	docker compose -f docker/docker-compose.yml down
+	docker compose --project-directory . -f docker/docker-compose.yml down
 
 clean:
 	rm -rf bin

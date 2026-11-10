@@ -7,9 +7,6 @@ services:
       # чтобы пережить перезапуск контейнера и не плодить дубликаты вкладок
       TOPICS_FILE: /app/data/topics.json
     volumes:
-      # Конфиг — единственный источник секретов; в образ он не попадает.
-      - ../.env:/app/.env:ro
-      - bot-data:/app/data
-
-volumes:
-  bot-data:
+      # .env и этот файл лежат в одной папке (на Synology: /volume1/docker/meshcore)
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
