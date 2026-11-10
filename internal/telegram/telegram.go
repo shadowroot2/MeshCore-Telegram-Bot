@@ -101,6 +101,15 @@ func (c *Client) CreateForumTopic(name string) (int64, error) {
 	return res.MessageThreadID, nil
 }
 
+// EditForumTopic renames a вкладка.
+func (c *Client) EditForumTopic(threadID int64, name string) error {
+	return c.call("editForumTopic", url.Values{
+		"chat_id":           {strconv.FormatInt(c.chatID, 10)},
+		"message_thread_id": {strconv.FormatInt(threadID, 10)},
+		"name":              {name},
+	}, nil)
+}
+
 // GetForumTopic returns the name of a вкладка by id.
 func (c *Client) GetForumTopic(threadID int64) (string, error) {
 	var res struct {

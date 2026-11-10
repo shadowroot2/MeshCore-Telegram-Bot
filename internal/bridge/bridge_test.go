@@ -20,19 +20,21 @@ func msg(text string, ts uint32, snr float32, hasSNR bool) companion.Message {
 
 // stubRadio implements the radio interface without any network.
 type stubRadio struct {
-	mu         sync.Mutex
-	chSent     []string // тексты канальных отправок
-	dmSent     []string // тексты DM
-	chNames    map[byte]string
-	chSecrets  map[byte][16]byte
-	setCalls   []string // имена, созданные через SetChannel
-	setSecrets [][16]byte
-	sentTs     []uint32 // timestamp'ы отправок
-	reply      string
-	replyEr    error
-	sendErr    error
-	ts         uint32
-	cliCalls   int // сколько раз дёргали RunCLI
+	mu            sync.Mutex
+	chSent        []string // тексты канальных отправок
+	dmSent        []string // тексты DM
+	chNames       map[byte]string
+	chSecrets     map[byte][16]byte
+	setCalls      []string // имена, созданные через SetChannel
+	setSecrets    [][16]byte
+	sentTs        []uint32 // timestamp'ы отправок
+	reply         string
+	replyEr       error
+	sendErr       error
+	ts            uint32
+	cliCalls      int // сколько раз дёргали RunCLI
+	chContacts    map[[6]byte]string
+	contactsCalls int
 }
 
 func (s *stubRadio) SendChannelText(idx byte, text string, ts uint32) error {
@@ -74,6 +76,17 @@ func (s *stubRadio) SetChannel(idx byte, name string, secret [16]byte) error {
 	return nil
 }
 
+func (s *stubRadio) Contacts() (map[[6]byte]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.contactsCalls++
+	out := map[[6]byte]string{}
+	for k, v := range s.chContacts {
+		out[k] = v
+	}
+	return out, nil
+}
+
 func (s *stubRadio) RunCLI(line string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,6 +121,7 @@ type stubTG struct {
 	nextID      int64
 	topicFailN  int // fail this many CreateForumTopic calls first
 	threadNames map[int64]string
+	renames     []string
 	listed      map[string]int64 // имя вкладки -> thread id для ListForumTopics
 }
 
@@ -137,6 +151,13 @@ func (s *stubTG) ListForumTopics(maxThreadID, maxMisses int64) map[string]int64 
 		out[k] = v
 	}
 	return out
+}
+
+func (s *stubTG) EditForumTopic(threadID int64, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.renames = append(s.renames, name)
+	return nil
 }
 
 func (s *stubTG) GetForumTopic(threadID int64) (string, error) {
@@ -784,5 +805,57 @@ func TestLocationFromConfig(t *testing.T) {
 	_, off := time.Unix(0, 0).In(b.location()).Zone()
 	if off != 5*3600+30*60 {
 		t.Fatalf("offset = %d, want 5.5h", off)
+	}
+}
+
+func TestDMNameResolvedFromContacts(t *testing.T) {
+	prefix := [6]byte{0x02, 0x62, 0xAA, 0xBB, 0xCC, 0xDD}
+	// в снапшоте контакта нет (авто-добавленный), но радио уже знает имя
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.info.Contacts = map[[6]byte]string{}
+
+	dm := companion.Message{Kind: companion.KindDM, Prefix: prefix,
+		Text: "Привет", Time: 1}
+	if err := b.Deliver(dm); err != nil {
+		t.Fatal(err)
+	}
+
+	sent, _, created := tg.log()
+	if len(created) != 1 || created[0] != "Валера" {
+		t.Fatalf("topic must be named by the contact: %v", created)
+	}
+	if !strings.Contains(sent[0].text, "[Валера]") {
+		t.Fatalf("tag must carry the contact name: %q", sent[0].text)
+	}
+	if r.contactsCalls == 0 {
+		t.Fatal("contact list must be re-read for an unknown sender")
+	}
+}
+
+func TestDMTopicRenamedWhenNameKnown(t *testing.T) {
+	prefix := [6]byte{0x02, 0x62, 0xAA, 0xBB, 0xCC, 0xDD}
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	// вкладка уже создана раньше с fallback-именем
+	b.topics.bind(dmKey(prefix), 55, "dm-0262")
+
+	dm := companion.Message{Kind: companion.KindDM, Prefix: prefix,
+		Text: "снова", Time: 2}
+	if err := b.Deliver(dm); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(tg.renames) != 1 || tg.renames[0] != "Валера" {
+		t.Fatalf("topic must be renamed: %v", tg.renames)
+	}
+	sent, _, created := tg.log()
+	if len(created) != 0 {
+		t.Fatalf("no new topics expected: %v", created)
+	}
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "[Валера]") {
+		t.Fatalf("message must use the contact name: %v", sent)
 	}
 }

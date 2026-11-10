@@ -40,6 +40,7 @@ type radio interface {
 	SendContactText(prefix [6]byte, text string, ts uint32) error
 	QueryChannel(idx byte) (string, [16]byte, error)
 	SetChannel(idx byte, name string, secret [16]byte) error
+	Contacts() (map[[6]byte]string, error)
 	RunCLI(line string) (string, error)
 }
 
@@ -51,6 +52,7 @@ type Telegram interface {
 	SendMessage(text string, threadID int64) error
 	ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	CreateForumTopic(name string) (int64, error)
+	EditForumTopic(threadID int64, name string) error
 	GetForumTopic(threadID int64) (string, error)
 	ListForumTopics(maxThreadID, maxMisses int64) map[string]int64
 }
@@ -66,27 +68,42 @@ type target struct {
 
 // topics maps mesh endpoints to Telegram forum topic ids and persists the
 // mapping so restarts reuse topics instead of creating duplicates.
+type topicEntry struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
 type topics struct {
 	mu    sync.Mutex
 	path  string
-	byKey map[string]int64
+	byKey map[string]topicEntry
 	byID  map[int64]string
 }
 
 func loadTopics(path string) *topics {
-	t := &topics{path: path, byKey: map[string]int64{}, byID: map[int64]string{}}
+	t := &topics{path: path, byKey: map[string]topicEntry{}, byID: map[int64]string{}}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Printf("topics: %s: %v (start empty — все темы будут созданы заново)", path, err)
 		return t
 	}
-	var raw map[string]int64
+	var raw map[string]topicEntry
 	if err := json.Unmarshal(data, &raw); err != nil {
-		log.Printf("topics: %s: %v", path, err)
-		return t
-	}
-	for k, id := range raw {
-		t.byKey[k], t.byID[id] = id, k
+		// старый формат: {"ch:0": 10} — имя вкладки неизвестно
+		var legacy map[string]int64
+		if err2 := json.Unmarshal(data, &legacy); err2 != nil {
+			log.Printf("topics: %s: %v", path, err)
+			return t
+		}
+		for k, id := range legacy {
+			t.byKey[k] = topicEntry{ID: id}
+			t.byID[id] = k
+		}
+	} else {
+		for k, e := range raw {
+			t.byKey[k] = e
+			t.byID[e.ID] = k
+		}
 	}
 	log.Printf("topics: %s: %d mappings loaded", path, len(t.byKey))
 	return t
@@ -95,8 +112,8 @@ func loadTopics(path string) *topics {
 func (t *topics) thread(key string) (int64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	id, ok := t.byKey[key]
-	return id, ok
+	e, ok := t.byKey[key]
+	return e.ID, ok
 }
 
 func (t *topics) key(thread int64) (string, bool) {
@@ -106,12 +123,13 @@ func (t *topics) key(thread int64) (string, bool) {
 	return k, ok
 }
 
-func (t *topics) bind(key string, thread int64) {
+func (t *topics) bind(key string, thread int64, name string) {
 	t.mu.Lock()
-	t.byKey[key], t.byID[thread] = thread, key
-	raw := make(map[string]int64, len(t.byKey))
-	for k, id := range t.byKey {
-		raw[k] = id
+	t.byKey[key] = topicEntry{ID: thread, Name: name}
+	t.byID[thread] = key
+	raw := make(map[string]topicEntry, len(t.byKey))
+	for k, e := range t.byKey {
+		raw[k] = e
 	}
 	t.mu.Unlock()
 
@@ -126,17 +144,30 @@ func (t *topics) bind(key string, thread int64) {
 
 // ensure returns the topic for key, creating it once; 0 means General.
 // Creation is retried: Telegram rate-limits topic creation, and a failed
-// attempt would otherwise park the whole topic in General forever.
+// attempt would otherwise park the whole topic in General forever. If the
+// вкладка уже существует под другим именем (например dm-xxxx до того, как
+// стал известен контакт) — она переименовывается.
 func (t *topics) ensure(key, name string, tg Telegram) int64 {
-	if id, ok := t.thread(key); ok {
-		return id
+	t.mu.Lock()
+	e, ok := t.byKey[key]
+	t.mu.Unlock()
+	if ok {
+		if e.Name != name {
+			if err := tg.EditForumTopic(e.ID, name); err != nil {
+				log.Printf("topics: rename %q -> %q: %v", e.Name, name, err)
+			} else {
+				log.Printf("topics: %q renamed to %q", e.Name, name)
+				t.bind(key, e.ID, name)
+			}
+		}
+		return e.ID
 	}
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
 		var id int64
 		id, err = tg.CreateForumTopic(name)
 		if err == nil {
-			t.bind(key, id)
+			t.bind(key, id, name)
 			return id
 		}
 		log.Printf("topics: create %q: %v (retrying)", name, err)
@@ -222,14 +253,15 @@ func (b *Bridge) bindExistingTopics() {
 	defer b.mu.Unlock()
 	for idx, name := range b.info.Channels {
 		if id, ok := byName[strings.ToLower(name)]; ok {
-			b.topics.bind(channelKey(idx), id)
+			b.topics.bind(channelKey(idx), id, name)
 		}
 	}
 	for prefix, name := range b.info.Contacts {
 		if id, ok := byName[strings.ToLower(name)]; ok {
-			b.topics.bind(dmKey(prefix), id)
+			b.topics.bind(dmKey(prefix), id, name)
 		}
 	}
+	// DM-вкладки с fallback-именем (dm-xxxx) тоже найдутся по имени контакта
 	log.Printf("topics: group has %d вкладок, привязано по имени", len(existing))
 }
 
@@ -257,11 +289,32 @@ func (b *Bridge) Deliver(m companion.Message) error {
 	return b.tg.SendMessage(formatForTelegram(m, dmName, b.location()), thread)
 }
 
+// contactName возвращает имя контакта; для неизвестного/безымянного префикса
+// перечитывает список контактов радио — авто-добавленные узнают имена из
+// advert'ов не сразу, и снапшот со старта сессии их ещё не содержит.
+func (b *Bridge) contactName(prefix [6]byte) string {
+	if n := b.info.Contacts[prefix]; n != "" {
+		return n
+	}
+	if b.r == nil {
+		return ""
+	}
+	list, err := b.r.Contacts()
+	if err != nil {
+		log.Printf("contacts: %v", err)
+		return ""
+	}
+	for p, n := range list {
+		b.info.Contacts[p] = n
+	}
+	return b.info.Contacts[prefix]
+}
+
 func (b *Bridge) targetFor(m companion.Message) target {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if m.Kind == companion.KindDM {
-		name := b.info.Contacts[m.Prefix]
+		name := b.contactName(m.Prefix)
 		if name == "" {
 			name = "dm-" + fmt.Sprintf("%x", m.Prefix)[:4]
 		}
@@ -439,7 +492,7 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 		log.Printf("topics: channel %q -> idx %d created", name, idx)
 	}
 
-	b.topics.bind(channelKey(byte(idx)), threadID)
+	b.topics.bind(channelKey(byte(idx)), threadID, name)
 	return true
 }
 

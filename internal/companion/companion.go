@@ -347,9 +347,11 @@ func Session(addr, defaultChannel string, hooks Hooks, deliver func(Message) err
 	if err := c.resolveChannels(&info, defaultChannel); err != nil {
 		return err
 	}
-	if err := c.syncContacts(&info); err != nil {
+	if contacts, err := c.Contacts(); err != nil {
 		// contacts only name the DM topics; run without names rather than die
 		log.Printf("radio: contacts sync failed: %v", err)
+	} else {
+		info.Contacts = contacts
 	}
 	log.Printf("radio: %d channels, %d contacts, default %q -> idx %d",
 		len(info.Channels), len(info.Contacts), defaultChannel, info.DefaultIdx)
@@ -422,28 +424,32 @@ done:
 // syncContacts dumps the contact list (name by pubkey prefix) so DM topics can
 // be named. The radio streams CONTACT frames after CONTACT_START until
 // CONTACT_END.
-func (c *Client) syncContacts(info *SessionInfo) error {
+// Contacts dumps the radio's contact list: pubkey prefix -> name. Имена
+// авто-добавленных контактов появляются только после их advert'ов, поэтому
+// список можно перечитывать в любой момент.
+func (c *Client) Contacts() (map[[contactPrefixLen]byte]string, error) {
+	out := map[[contactPrefixLen]byte]string{}
 	if err := c.send([]byte{cmdGetContacts}); err != nil {
-		return err
+		return nil, err
 	}
 	for {
 		f, err := c.recv()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		switch f[0] {
 		case pushMsgWaiting:
 			continue
 		case pktError:
-			return radioErr("GET_CONTACTS", f)
+			return nil, radioErr("GET_CONTACTS", f)
 		case pktContact:
 			if len(f) >= contactFrameMin {
 				var prefix [contactPrefixLen]byte
 				copy(prefix[:], f[contactPrefixOff:contactPrefixOff+contactPrefixLen])
-				info.Contacts[prefix] = trimNUL(f[contactNameOff : contactNameOff+32])
+				out[prefix] = trimNUL(f[contactNameOff : contactNameOff+32])
 			}
 		case pktContactEnd:
-			return nil
+			return out, nil
 		}
 	}
 }
