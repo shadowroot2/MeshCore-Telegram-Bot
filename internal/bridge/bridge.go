@@ -258,7 +258,6 @@ func (b *Bridge) announce(info companion.SessionInfo) {
 		b.mu.Unlock()
 		return
 	}
-	b.announced = true
 	b.mu.Unlock()
 
 	thread := int64(0) // General как запасной вариант
@@ -272,8 +271,13 @@ func (b *Bridge) announce(info companion.SessionInfo) {
 	text := fmt.Sprintf("🚀 MeshCore bot запущен и подключен к «%s» (%s) · каналов: %d · контактов: %d",
 		info.NodeName, info.Addr, len(info.Channels), len(info.Contacts))
 	if err := b.tg.SendMessage(text, thread); err != nil {
+		// не помечаем отправленным — попробуем при следующем подключении
 		log.Printf("telegram: %v", err)
+		return
 	}
+	b.mu.Lock()
+	b.announced = true
+	b.mu.Unlock()
 }
 
 // location — пояс для шапок сообщений (TZ_OFFSET из конфига).
@@ -282,7 +286,7 @@ func (b *Bridge) location() *time.Location {
 }
 
 // syncTopics: существующие вкладки привязываются по имени, недостающие —
-// создаются; ключи #-каналов приводятся к стандартному Public.
+// создаются; ключи #-каналов приводятся к выводному из имени.
 func (b *Bridge) syncTopics() {
 	b.bindExistingTopics()
 
@@ -766,20 +770,22 @@ func splitSender(text string) (name, rest string) {
 	return "", text
 }
 
-// quotedContact extracts the "[Имя]" prefix from a (possibly header-prefixed)
-// message text.
+// quotedContact extracts the "[Имя]" prefix from a quoted message text. The
+// tag rides the first body line: line 2 after the metadata header, line 1
+// without it — многострочное сообщение не должно терять упоминание.
 func quotedContact(text string) string {
-	if i := strings.LastIndexByte(text, '\n'); i >= 0 {
-		text = text[i+1:]
+	lines := strings.SplitN(text, "\n", 3)
+	if len(lines) > 2 {
+		lines = lines[:2]
 	}
-	if !strings.HasPrefix(text, "[") {
-		return ""
+	for _, line := range lines {
+		if strings.HasPrefix(line, "[") {
+			if i := strings.IndexByte(line, ']'); i > 1 {
+				return line[1:i]
+			}
+		}
 	}
-	i := strings.IndexByte(text, ']')
-	if i <= 1 {
-		return ""
-	}
-	return text[1:i]
+	return ""
 }
 
 // formatForTelegram renders the mesh metadata header: "18:37 · SNR 8.5 dB"

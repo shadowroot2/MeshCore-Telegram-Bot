@@ -425,9 +425,6 @@ done:
 	return nil
 }
 
-// syncContacts dumps the contact list (name by pubkey prefix) so DM topics can
-// be named. The radio streams CONTACT frames after CONTACT_START until
-// CONTACT_END.
 // Contacts dumps the radio's contact list: pubkey prefix -> name. Имена
 // авто-добавленных контактов появляются только после их advert'ов, поэтому
 // список можно перечитывать в любой момент.

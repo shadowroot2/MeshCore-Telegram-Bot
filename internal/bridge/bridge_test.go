@@ -940,3 +940,34 @@ func TestAnnounceToPublicOnce(t *testing.T) {
 		t.Fatalf("announcement must go to the Public topic, got thread %d", sent[0].thread)
 	}
 }
+
+func TestQuotedContactMultiLine(t *testing.T) {
+	// многострочное сообщение: тег [Имя] на первой строке тела
+	cases := map[string]string{
+		"[Валера] строка один\nстрока два\nстрока три": "Валера",
+		"18:37 · SNR 8.5 dB\n[Валера] один\nдва":       "Валера",
+		"18:37\nпросто текст\nи ещё":                   "",
+	}
+	for text, want := range cases {
+		if got := quotedContact(text); got != want {
+			t.Fatalf("quotedContact(%q) = %q, want %q", text, got, want)
+		}
+	}
+}
+
+func TestAnnounceRetriesAfterFailure(t *testing.T) {
+	tg := &stubTG{sendFailN: 1}
+	r := &stubRadio{chNames: map[byte]string{0: "Public"}}
+	b := newTestBridge(t, tg, r)
+	b.topics.bind(channelKey(0), 10, "Public")
+
+	info := companion.SessionInfo{NodeName: "X", Addr: "1.2.3.4:5000",
+		Channels: map[byte]string{0: "Public"}, Contacts: map[[6]byte]string{}}
+	b.announce(info) // падает — не должно помечаться отправленным
+	b.announce(info) // повтор при «следующем подключении»
+
+	sent, _, _ := tg.log()
+	if len(sent) != 1 {
+		t.Fatalf("announcement must be retried after a failure, got %d sends", len(sent))
+	}
+}
