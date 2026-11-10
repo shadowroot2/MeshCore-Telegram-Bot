@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shadowroot2/MeshCore-Telegram-Bot/internal/companion"
 	"github.com/shadowroot2/MeshCore-Telegram-Bot/internal/telegram"
@@ -27,6 +28,7 @@ const maxNameLen = 32 // sender name budget before it eats the mesh text
 type radio interface {
 	SendChannelText(idx byte, text string) (uint32, error)
 	SendContactText(prefix [6]byte, text string) (uint32, error)
+	QueryChannel(idx byte) (string, error)
 	RunCLI(line string) (string, error)
 }
 
@@ -108,17 +110,25 @@ func (t *topics) bind(key string, thread int64) {
 }
 
 // ensure returns the topic for key, creating it once; 0 means General.
+// Creation is retried: Telegram rate-limits topic creation, and a failed
+// attempt would otherwise park the whole topic in General forever.
 func (t *topics) ensure(key, name string, tg Telegram) int64 {
 	if id, ok := t.thread(key); ok {
 		return id
 	}
-	id, err := tg.CreateForumTopic(name)
-	if err != nil {
-		log.Printf("topics: create %q: %v (posting to General)", name, err)
-		return 0
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var id int64
+		id, err = tg.CreateForumTopic(name)
+		if err == nil {
+			t.bind(key, id)
+			return id
+		}
+		log.Printf("topics: create %q: %v (retrying)", name, err)
+		time.Sleep(time.Second)
 	}
-	t.bind(key, id)
-	return id
+	log.Printf("topics: create %q: %v (posting to General)", name, err)
+	return 0
 }
 
 // Bridge wires the mesh session to the Telegram forum group: one вкладка per
@@ -144,6 +154,7 @@ func (b *Bridge) Attach(c *companion.Client, info companion.SessionInfo) {
 
 	for idx, name := range info.Channels {
 		b.topics.ensure(channelKey(idx), name, b.tg)
+		time.Sleep(250 * time.Millisecond) // Telegram rate-limits topic creation
 	}
 }
 
@@ -164,7 +175,11 @@ func (b *Bridge) Online() bool {
 func (b *Bridge) Deliver(m companion.Message) error {
 	t := b.targetFor(m)
 	thread := b.topics.ensure(t.key, t.name, b.tg)
-	return b.tg.SendMessage(formatForTelegram(m), thread)
+	dmName := ""
+	if m.Kind == companion.KindDM {
+		dmName = t.name
+	}
+	return b.tg.SendMessage(formatForTelegram(m, dmName), thread)
 }
 
 func (b *Bridge) targetFor(m companion.Message) target {
@@ -183,6 +198,13 @@ func (b *Bridge) targetFor(m companion.Message) target {
 		}
 	}
 	name := b.info.Channels[m.ChannelIdx]
+	if name == "" && b.r != nil {
+		// канал мог появиться после старта сессии — спросим радио
+		if n, err := b.r.QueryChannel(m.ChannelIdx); err == nil && n != "" {
+			name = n
+			b.info.Channels[m.ChannelIdx] = n
+		}
+	}
 	if name == "" {
 		name = fmt.Sprintf("channel-%d", m.ChannelIdx)
 	}
@@ -298,25 +320,35 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 			offset = u.UpdateID + 1
 			continue
 		}
-		text := meshText(m)
-		if text == "" {
-			offset = u.UpdateID + 1
-			continue
-		}
 		tgt, ok := b.targetFromThread(m)
 		if !ok {
 			log.Printf("mesh: unknown topic (thread %d), skipping", m.MessageThreadID)
 			offset = u.UpdateID + 1
 			continue
 		}
-		ts, err := b.sendTo(tgt, text)
-		if err != nil {
-			log.Printf("mesh: %v, will retry %q", err, text)
-			return offset
+		budget := companion.MaxDMText
+		if tgt.kind == companion.KindChannel {
+			budget = companion.MaxChannelText
+		}
+		chunks := meshMessages(m, budget)
+		if len(chunks) == 0 {
+			offset = u.UpdateID + 1
+			continue
+		}
+		var ts uint32
+		var err error
+		for _, chunk := range chunks {
+			ts, err = b.sendTo(tgt, chunk)
+			if err != nil {
+				// offset остаётся: Telegram доставит сообщение повторно
+				log.Printf("mesh: %v, will retry %q", err, chunk)
+				return offset
+			}
 		}
 		offset = u.UpdateID + 1
 		if tgt.kind == companion.KindChannel {
-			// retransmit feedback only exists for channel floods
+			// retransmit feedback only exists for channel floods; один ответ
+			// на всё сообщение — по последней части
 			go checkHeard(b, m, ts)
 		}
 	}
@@ -341,10 +373,48 @@ func channelKey(idx byte) string { return fmt.Sprintf("ch:%d", idx) }
 
 func dmKey(prefix [6]byte) string { return fmt.Sprintf("dm:%x", prefix) }
 
+// splitSender extracts the "Имя: " prefix MeshCore senders bake into channel
+// texts; the name is kept as "[Имя]" so a quoted reply can address it.
+func splitSender(text string) (name, rest string) {
+	head := text
+	if len(head) > maxNameLen+2 {
+		head = head[:maxNameLen+2]
+	}
+	if i := strings.Index(head, ": "); i > 0 {
+		return text[:i], text[i+2:]
+	}
+	return "", text
+}
+
+// quotedContact extracts the "[Имя]" prefix from a (possibly header-prefixed)
+// message text.
+func quotedContact(text string) string {
+	if i := strings.LastIndexByte(text, '\n'); i >= 0 {
+		text = text[i+1:]
+	}
+	if !strings.HasPrefix(text, "[") {
+		return ""
+	}
+	i := strings.IndexByte(text, ']')
+	if i <= 1 {
+		return ""
+	}
+	return text[1:i]
+}
+
 // formatForTelegram renders the mesh metadata header: "18:37 · SNR 8.5 dB"
-// on its own line above the text. A zero mesh timestamp (no clock on the
-// sending node) is left out rather than shown as epoch.
-func formatForTelegram(m companion.Message) string {
+// on its own line above "[Имя] текст". A zero mesh timestamp (no clock on
+// the sending node) is left out rather than shown as epoch. dmName names the
+// contact for DMs, whose wire text carries no sender prefix.
+func formatForTelegram(m companion.Message, dmName string) string {
+	name, text := splitSender(m.Text)
+	if name == "" {
+		name, text = dmName, m.Text
+	}
+	if name != "" {
+		text = "[" + name + "] " + text
+	}
+
 	head := ""
 	if m.Time > 0 {
 		head = time.Unix(int64(m.Time), 0).Format("15:04")
@@ -356,35 +426,90 @@ func formatForTelegram(m companion.Message) string {
 		head += fmt.Sprintf("SNR %.1f dB", m.SNR)
 	}
 	if head == "" {
-		return m.Text
+		return text
 	}
-	return head + "\n" + m.Text
+	return head + "\n" + text
 }
 
 // formatHeard renders the repeater-count reply.
 func formatHeard(n int) string {
 	switch {
 	case n < 0:
-		return "нет данных о доставке"
+		return "📡 нет данных о доставке"
 	case n == 0:
-		return "никто не услышал"
+		return "❌ никто не услышал"
 	default:
-		return fmt.Sprintf("%d %s %s", n,
-			plural(n, "репиттер", "репиттера", "репиттеров"),
-			plural(n, "услышал", "услышали", "услышали"))
+		return fmt.Sprintf("📡 %s %d %s",
+			plural(n, "услышал", "услышали", "услышали"),
+			n,
+			plural(n, "репиттер", "репиттера", "репиттеров"))
 	}
 }
 
-// meshText is what goes into the mesh for a Telegram message: "<name>: <text>".
-// Whitespace-only messages yield "" and are skipped; a very long display name
-// is cut so the message body still fits the frame.
-func meshText(m *telegram.Message) string {
+// meshMessages renders a Telegram message into one or more mesh texts, each
+// within budget bytes: "<name>: [@Имя] chunk". The quote mention rides the
+// first chunk only. Whitespace-only messages yield nothing; a very long
+// display name is cut so the body still fits.
+func meshMessages(m *telegram.Message, budget int) []string {
 	body := strings.TrimSpace(m.Text)
 	if body == "" {
-		return ""
+		return nil
+	}
+	mention := ""
+	if m.ReplyToMessage != nil {
+		if who := quotedContact(m.ReplyToMessage.Text); who != "" {
+			mention = "@" + who + " "
+		}
 	}
 	name := companion.Truncate(senderName(m), maxNameLen)
-	return name + ": " + body
+	prefix := name + ": "
+
+	avail := budget - len(prefix) - len(mention)
+	if avail < 1 {
+		avail = 1
+	}
+	chunks := splitText(body, avail)
+
+	out := make([]string, 0, len(chunks))
+	for i, ch := range chunks {
+		if i == 0 {
+			out = append(out, prefix+mention+ch)
+		} else {
+			out = append(out, prefix+ch)
+		}
+	}
+	return out
+}
+
+// splitText cuts text into pieces of at most budget bytes, never splitting a
+// rune and preferring word boundaries.
+func splitText(text string, budget int) []string {
+	if budget < 1 {
+		budget = 1
+	}
+	var out []string
+	for len(text) > budget {
+		cut := budget
+		if i := strings.LastIndexAny(text[:cut], " \n"); i > 0 {
+			cut = i
+		} else {
+			for cut > 0 && !utf8.RuneStart(text[cut]) {
+				cut--
+			}
+		}
+		if cut < 1 {
+			cut = budget
+			for cut < len(text) && !utf8.RuneStart(text[cut]) {
+				cut++
+			}
+		}
+		out = append(out, text[:cut])
+		text = strings.TrimLeft(text[cut:], " \n")
+	}
+	if text != "" {
+		out = append(out, text)
+	}
+	return out
 }
 
 func senderName(m *telegram.Message) string {

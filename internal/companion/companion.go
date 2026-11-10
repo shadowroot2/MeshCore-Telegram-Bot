@@ -44,8 +44,6 @@ const (
 
 	txtTypePlain     = 0
 	maxFrameLen      = 2048
-	maxChanTextLen   = 169 // MAX_FRAME_SIZE 176 - 7 byte channel send header
-	maxDMTextLen     = 163 // MAX_FRAME_SIZE 176 - 13 byte DM send header
 	ackTimeout       = 15 * time.Second
 	maxGroupChannels = 8
 
@@ -61,6 +59,12 @@ const (
 	contactPrefixLen = 6
 	contactNameOff   = 100 // within [0x03]: 1+32+1+1+1+64
 	contactFrameMin  = 148
+)
+
+// Text budgets for one send: MAX_FRAME_SIZE 176 minus the send header.
+const (
+	MaxChannelText = 169 // 7-byte channel header
+	MaxDMText      = 163 // 13-byte DM header
 )
 
 // Kind says what a delivered Message is.
@@ -187,7 +191,7 @@ func (c *Client) nextTs() uint32 {
 // SendChannelText posts to a mesh channel and waits for the radio's OK/ERROR
 // ack. Returns the message timestamp used, which `send.heard <ts>` keys on.
 func (c *Client) SendChannelText(idx byte, text string) (uint32, error) {
-	text = Truncate(text, maxChanTextLen)
+	text = Truncate(text, MaxChannelText)
 	ts := c.nextTs()
 	payload := make([]byte, 7+len(text))
 	payload[0] = cmdSendChannelTxtMsg
@@ -209,7 +213,7 @@ func (c *Client) SendChannelText(idx byte, text string) (uint32, error) {
 // SendContactText sends a DM to a contact by pubkey prefix and waits for the
 // radio's PACKET_SENT ack.
 func (c *Client) SendContactText(prefix [contactPrefixLen]byte, text string) (uint32, error) {
-	text = Truncate(text, maxDMTextLen)
+	text = Truncate(text, MaxDMText)
 	ts := c.nextTs()
 	payload := make([]byte, 13+len(text))
 	payload[0] = cmdSendTxtMsg
@@ -227,6 +231,18 @@ func (c *Client) SendContactText(prefix [contactPrefixLen]byte, text string) (ui
 		return 0, radioErr("DM send", f)
 	}
 	return ts, nil
+}
+
+// QueryChannel returns the name of a channel slot by index.
+func (c *Client) QueryChannel(idx byte) (string, error) {
+	f, err := c.request([]byte{cmdGetChannel, idx}, pktChannelInfo, pktError)
+	if err != nil {
+		return "", err
+	}
+	if f[0] != pktChannelInfo || len(f) < channelInfoName {
+		return "", radioErr("GET_CHANNEL", f)
+	}
+	return trimNUL(f[2:channelInfoName]), nil
 }
 
 // RunCLI runs a text CLI line on the radio and returns its reply text.
@@ -457,7 +473,7 @@ func (c *Client) syncLoop(deliver func(Message) error) error {
 				}
 			}
 			continue
-		case pktOK, pktError, pktSent, pktCliReply:
+		case pktOK, pktError, pktSent, pktCliReply, pktChannelInfo:
 			c.deliverResp(f)
 			continue
 		case pktNoMoreMsgs:

@@ -34,12 +34,13 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID       int64  `json:"message_id"`
-	MessageThreadID int64  `json:"message_thread_id"`
-	IsTopicMessage  bool   `json:"is_topic_message"`
-	Text            string `json:"text"`
-	Chat            Chat   `json:"chat"`
-	From            From   `json:"from"`
+	MessageID       int64    `json:"message_id"`
+	MessageThreadID int64    `json:"message_thread_id"`
+	IsTopicMessage  bool     `json:"is_topic_message"`
+	Text            string   `json:"text"`
+	Chat            Chat     `json:"chat"`
+	From            From     `json:"from"`
+	ReplyToMessage  *Message `json:"reply_to_message"`
 }
 
 type Chat struct {

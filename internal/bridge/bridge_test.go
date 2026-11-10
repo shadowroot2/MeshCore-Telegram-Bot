@@ -1,11 +1,13 @@
 package bridge
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shadowroot2/MeshCore-Telegram-Bot/internal/companion"
 	"github.com/shadowroot2/MeshCore-Telegram-Bot/internal/telegram"
@@ -18,8 +20,9 @@ func msg(text string, ts uint32, snr float32, hasSNR bool) companion.Message {
 // stubRadio implements the radio interface without any network.
 type stubRadio struct {
 	mu      sync.Mutex
-	chSent  []string // "idx:text"
-	dmSent  []string // "prefixhex:text"
+	chSent  []string // тексты канальных отправок
+	dmSent  []string // тексты DM
+	chNames map[byte]string
 	reply   string
 	replyEr error
 	sendErr error
@@ -48,6 +51,12 @@ func (s *stubRadio) SendContactText(prefix [6]byte, text string) (uint32, error)
 	return s.ts, nil
 }
 
+func (s *stubRadio) QueryChannel(idx byte) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.chNames[idx], nil
+}
+
 func (s *stubRadio) RunCLI(line string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -74,11 +83,12 @@ type outReply struct {
 // stubTG implements the Telegram interface, recording outgoing traffic and
 // minting topic ids on createForumTopic.
 type stubTG struct {
-	mu      sync.Mutex
-	sent    []outMsg
-	replies []outReply
-	created []string
-	nextID  int64
+	mu         sync.Mutex
+	sent       []outMsg
+	replies    []outReply
+	created    []string
+	nextID     int64
+	topicFailN int // fail this many CreateForumTopic calls first
 }
 
 func (s *stubTG) ChatID() int64 { return -100500 }
@@ -102,10 +112,16 @@ func (s *stubTG) ReplyToMessage(threadID, replyToMsgID int64, text string) error
 func (s *stubTG) CreateForumTopic(name string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.topicFailN > 0 {
+		s.topicFailN--
+		return 0, errCreateTopic
+	}
 	s.created = append(s.created, name)
 	s.nextID++
 	return s.nextID, nil
 }
+
+var errCreateTopic = errors.New("Too Many Requests: retry after 1")
 
 func (s *stubTG) log() ([]outMsg, []outReply, []string) {
 	s.mu.Lock()
@@ -168,12 +184,44 @@ func TestDeliverRoutesToTopics(t *testing.T) {
 	if !strings.Contains(sent[0].text, "SNR 8.5 dB") {
 		t.Fatalf("mesh formatting lost: %q", sent[0].text)
 	}
+	if !strings.Contains(sent[1].text, "[Валера] личка") {
+		t.Fatalf("DM must carry the contact name: %q", sent[1].text)
+	}
 	want := map[string]bool{"Public": true, "Валера": true}
 	for _, name := range created {
 		delete(want, name)
 	}
 	if len(want) != 0 {
 		t.Fatalf("topics not created for %v (created %v)", want, created)
+	}
+}
+
+func TestDeliverResolvesUnknownChannel(t *testing.T) {
+	tg := &stubTG{}
+	// канал появился после старта сессии: в info его нет, радио подскажет имя
+	b := newTestBridge(t, tg, &stubRadio{chNames: map[byte]string{5: "zephcore"}})
+
+	m := companion.Message{Kind: companion.KindChannel, ChannelIdx: 5,
+		Text: "в новый канал", Time: 1}
+	if err := b.Deliver(m); err != nil {
+		t.Fatal(err)
+	}
+
+	sent, _, created := tg.log()
+	if len(created) != 1 || created[0] != "zephcore" {
+		t.Fatalf("topic name %v, want [zephcore]", created)
+	}
+	if sent[0].thread == 0 {
+		t.Fatalf("message parked in General: %v", sent)
+	}
+}
+
+func TestTopicsEnsureRetries(t *testing.T) {
+	tg := &stubTG{topicFailN: 1}
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"))
+	id := b.topics.ensure("ch:0", "Public", tg)
+	if id == 0 {
+		t.Fatal("ensure must retry a failed creation")
 	}
 }
 
@@ -224,7 +272,7 @@ func TestProcessUpdatesRoutesByTopic(t *testing.T) {
 		for _, rep := range replies {
 			if rep.to == 12 {
 				found = true
-				if rep.thread != chThread || rep.text != "2 репиттера услышали" {
+				if rep.thread != chThread || rep.text != "📡 услышали 2 репиттера" {
 					t.Fatalf("heard reply %v", rep)
 				}
 			}
@@ -271,7 +319,7 @@ func TestCheckHeardReplyTexts(t *testing.T) {
 	if len(replies) != 1 {
 		t.Fatalf("got %d replies", len(replies))
 	}
-	if replies[0].to != 42 || replies[0].thread != 7 || replies[0].text != "3 репиттера услышали" {
+	if replies[0].to != 42 || replies[0].thread != 7 || replies[0].text != "📡 услышали 3 репиттера" {
 		t.Fatalf("reply: %+v", replies[0])
 	}
 }
@@ -290,36 +338,53 @@ func TestHeardCountGarbageReply(t *testing.T) {
 func TestFormatForTelegram(t *testing.T) {
 	m := msg("привет из меша", 1700000000, 8.5, true)
 	want := time.Unix(1700000000, 0).Format("15:04") + " · SNR 8.5 dB\nпривет из меша"
-	if got := formatForTelegram(m); got != want {
+	if got := formatForTelegram(m, ""); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 
-	m2 := msg("без SNR", 1700000000, 0, false)
-	want2 := time.Unix(1700000000, 0).Format("15:04") + "\nбез SNR"
-	if got := formatForTelegram(m2); got != want2 {
-		t.Fatalf("got %q, want %q", got, want2)
-	}
-
-	m3 := msg("без часов", 0, 8.5, true)
-	if got := formatForTelegram(m3); got != "SNR 8.5 dB\nбез часов" {
+	// wire-префикс "Имя: " превращается в "[Имя]"
+	m2 := msg("ShadoW: И тебе привет", 0, 0, false)
+	if got := formatForTelegram(m2, ""); got != "[ShadoW] И тебе привет" {
 		t.Fatalf("got %q", got)
 	}
 
-	m4 := msg("голый текст", 0, 0, false)
-	if got := formatForTelegram(m4); got != "голый текст" {
+	// DM: имя контакта подставляется, т.к. в тексте его нет
+	m3 := msg("личка", 1700000000, 0, false)
+	want3 := time.Unix(1700000000, 0).Format("15:04") + "\n[Валера] личка"
+	if got := formatForTelegram(m3, "Валера"); got != want3 {
+		t.Fatalf("got %q, want %q", got, want3)
+	}
+
+	m4 := msg("без часов", 0, 8.5, true)
+	if got := formatForTelegram(m4, ""); got != "SNR 8.5 dB\nбез часов" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestQuotedContact(t *testing.T) {
+	cases := map[string]string{
+		"[Валера] привет":                     "Валера",
+		"18:37 · SNR 8.5 dB\n[Валера] привет": "Валера",
+		"привет":         "",
+		"[Валера привет": "",
+		"18:37\n[shadoW-длинный-тег] текст": "shadoW-длинный-тег",
+	}
+	for text, want := range cases {
+		if got := quotedContact(text); got != want {
+			t.Fatalf("quotedContact(%q) = %q, want %q", text, got, want)
+		}
 	}
 }
 
 func TestFormatHeard(t *testing.T) {
 	cases := map[int]string{
-		-1: "нет данных о доставке",
-		0:  "никто не услышал",
-		1:  "1 репиттер услышал",
-		2:  "2 репиттера услышали",
-		5:  "5 репиттеров услышали",
-		12: "12 репиттеров услышали",
-		21: "21 репиттер услышал",
+		-1: "📡 нет данных о доставке",
+		0:  "❌ никто не услышал",
+		1:  "📡 услышал 1 репиттер",
+		2:  "📡 услышали 2 репиттера",
+		5:  "📡 услышали 5 репиттеров",
+		12: "📡 услышали 12 репиттеров",
+		21: "📡 услышал 21 репиттер",
 	}
 	for n, want := range cases {
 		if got := formatHeard(n); got != want {
@@ -328,25 +393,100 @@ func TestFormatHeard(t *testing.T) {
 	}
 }
 
-func TestMeshText(t *testing.T) {
+func TestMeshMessages(t *testing.T) {
 	m := &telegram.Message{Text: "  привет  ", From: telegram.From{FirstName: "Иван"}}
-	if got := meshText(m); got != "Иван: привет" {
-		t.Fatalf("got %q", got)
+	if got := meshMessages(m, 100); len(got) != 1 || got[0] != "Иван: привет" {
+		t.Fatalf("got %v", got)
 	}
 
 	m2 := &telegram.Message{Text: "   \n\t "}
-	if got := meshText(m2); got != "" {
-		t.Fatalf("whitespace-only must be skipped, got %q", got)
+	if got := meshMessages(m2, 100); got != nil {
+		t.Fatalf("whitespace-only must be skipped, got %v", got)
 	}
 
 	m3 := &telegram.Message{Text: "текст", From: telegram.From{FirstName: strings.Repeat("Д", 40)}}
-	got := meshText(m3)
-	if !strings.HasSuffix(got, ": текст") {
-		t.Fatalf("body must survive a long name, got %q", got)
+	got := meshMessages(m3, 100)
+	if len(got) != 1 || !strings.HasSuffix(got[0], ": текст") {
+		t.Fatalf("body must survive a long name, got %v", got)
 	}
-	name := strings.TrimSuffix(got, ": текст")
+	name := strings.TrimSuffix(got[0], ": текст")
 	if len(name) > maxNameLen {
 		t.Fatalf("name not capped: %d bytes", len(name))
+	}
+
+	// ответ (цитата) на сообщение с [Имя] упоминает контакт через @
+	m4 := &telegram.Message{Text: "да, согласен", From: telegram.From{FirstName: "Иван"},
+		ReplyToMessage: &telegram.Message{Text: "18:37 · SNR 8.5 dB\n[Валера] привет"}}
+	if got := meshMessages(m4, 100); len(got) != 1 || got[0] != "Иван: @Валера да, согласен" {
+		t.Fatalf("quote mention: %v", got)
+	}
+
+	// цитата без [Имя] — просто текст
+	m5 := &telegram.Message{Text: "да", From: telegram.From{FirstName: "Иван"},
+		ReplyToMessage: &telegram.Message{Text: "18:37\nпросто текст"}}
+	if got := meshMessages(m5, 100); len(got) != 1 || got[0] != "Иван: да" {
+		t.Fatalf("plain quote: %v", got)
+	}
+}
+
+func TestSplitText(t *testing.T) {
+	// режем по границе слова
+	parts := splitText("aaa bbb ccc", 7)
+	if strings.Join(parts, "|") != "aaa|bbb ccc" {
+		t.Fatalf("word split: %q", parts)
+	}
+	// кириллица не рвётся посередине руны
+	parts = splitText("йцукенгшщз", 4)
+	for _, p := range parts {
+		if !utf8.ValidString(p) {
+			t.Fatalf("broken rune in %q", parts)
+		}
+	}
+	// одно длинное слово без пробелов
+	parts = splitText(strings.Repeat("б", 25), 10)
+	if strings.Join(parts, "") != strings.Repeat("б", 25) {
+		t.Fatalf("hard split lost data: %q", parts)
+	}
+	for _, p := range parts {
+		if len(p) > 10 {
+			t.Fatalf("chunk over budget: %q", p)
+		}
+	}
+}
+
+func TestMeshMessagesSplitsLong(t *testing.T) {
+	body := strings.Repeat("слово ", 60) // 360 байт — больше лимита фрейма
+	m := &telegram.Message{Text: body, From: telegram.From{FirstName: "Иван"},
+		ReplyToMessage: &telegram.Message{Text: "18:37\n[Валера] привет"}}
+
+	chunks := meshMessages(m, companion.MaxChannelText)
+	if len(chunks) < 2 {
+		t.Fatalf("long message must split, got %d chunks", len(chunks))
+	}
+	if !strings.HasPrefix(chunks[0], "Иван: @Валера ") {
+		t.Fatalf("first chunk must carry the mention: %q", chunks[0])
+	}
+	for i, ch := range chunks {
+		if len(ch) > companion.MaxChannelText {
+			t.Fatalf("chunk %d over budget: %d bytes", i, len(ch))
+		}
+		if !strings.HasPrefix(ch, "Иван: ") {
+			t.Fatalf("chunk %d must keep attribution: %q", i, ch)
+		}
+		if i > 0 && strings.Contains(ch, "@Валера") {
+			t.Fatalf("mention must ride the first chunk only: %q", ch)
+		}
+	}
+	joined := ""
+	for i, ch := range chunks {
+		ch = strings.TrimPrefix(ch, "Иван: ")
+		if i == 0 {
+			ch = strings.TrimPrefix(ch, "@Валера ")
+		}
+		joined += ch + " "
+	}
+	if strings.Join(strings.Fields(joined), " ") != strings.Join(strings.Fields(body), " ") {
+		t.Fatal("chunks must preserve the full body")
 	}
 }
 
