@@ -1,0 +1,18 @@
+services:
+  meshcore-telegram-bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: meshcore-telegram-bot
+    container_name: meshcore-telegram-bot
+    restart: unless-stopped
+    environment:
+      # чтобы пережить перезапуск контейнера и не плодить дубликаты вкладок
+      TOPICS_FILE: /app/data/topics.json
+    volumes:
+      # Конфиг — единственный источник секретов; в образ он не попадает.
+      - ../.env:/app/.env:ro
+      - bot-data:/app/data
+
+volumes:
+  bot-data:

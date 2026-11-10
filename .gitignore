@@ -1,2 +1,6 @@
-meshcore-telegram-bot
-tg-forward
+/bin/
+.env
+/meshcore-telegram-bot
+/tg-forward
+/topics.json
+.idea/

@@ -1,0 +1,12 @@
+# Секреты не должны попадать в контекст сборки
+.env
+
+.git
+.github
+.gitignore
+README.md
+CLAUDE.md
+Makefile
+bin
+docker
+*_test.go
