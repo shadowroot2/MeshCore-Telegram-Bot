@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"crypto/sha256"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -635,25 +636,67 @@ func TestLinkTopicFindsChannelCreatedAfterAttach(t *testing.T) {
 	}
 }
 
-func TestLinkTopicEachChannelGetsOwnKey(t *testing.T) {
+func derivedKey(name string) [16]byte {
+	var s [16]byte
+	sum := sha256.Sum256([]byte(name))
+	copy(s[:], sum[:16])
+	return s
+}
+
+func TestLinkTopicPublicChannelDerivedKey(t *testing.T) {
 	tg := &stubTG{}
 	b := newTestBridge(t, tg, &stubRadio{})
 
-	if !b.linkTopic(60, "#первый") {
-		t.Fatal("linkTopic failed")
-	}
-	if !b.linkTopic(61, "#второй") {
+	if !b.linkTopic(58, "#публичный") {
 		t.Fatal("linkTopic failed")
 	}
 	sec := b.r.(*stubRadio).setSecrets
-	if len(sec) != 2 || sec[0] == sec[1] {
-		t.Fatalf("channels must not share a key: %x", sec)
+	if len(sec) != 1 || sec[0] != derivedKey("#публичный") {
+		t.Fatalf("#-channel key must derive from the name: %x", sec)
 	}
 	sent, _, _ := tg.log()
-	for _, msg := range sent {
-		if !strings.Contains(msg.text, "Ключ:") {
-			t.Fatalf("each channel must publish its key: %q", msg.text)
-		}
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "Публичный") {
+		t.Fatalf("public notice: %v", sent)
+	}
+	if strings.Contains(sent[0].text, "Ключ:") {
+		t.Fatalf("public channel must not dump a key: %q", sent[0].text)
+	}
+}
+
+func TestLinkTopicNormalizesWrongKey(t *testing.T) {
+	// #-канал на радио с чужим ключом (создан раньше/вручную)
+	r := &stubRadio{chNames: map[byte]string{0: "Public", 1: "#старый"},
+		chSecrets: map[byte][16]byte{1: {0xAA, 0xBB}}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+
+	if !b.linkTopic(59, "#старый") {
+		t.Fatal("linkTopic failed")
+	}
+	sec := r.setSecrets
+	if len(sec) != 1 || sec[0] != derivedKey("#старый") {
+		t.Fatalf("wrong key must be rewritten to the derived one: %x", sec)
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "приведён к публичному") {
+		t.Fatalf("normalize notice: %v", sent)
+	}
+}
+
+func TestLinkTopicPrivateChannelGetsRandomKey(t *testing.T) {
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, &stubRadio{})
+
+	if !b.linkTopic(60, "приватный") {
+		t.Fatal("linkTopic failed")
+	}
+	sec := b.r.(*stubRadio).setSecrets
+	if len(sec) != 1 || sec[0] == derivedKey("приватный") || sec[0] == meshcorePublicPSK {
+		t.Fatalf("private channel must get a random key: %x", sec)
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "Ключ:") {
+		t.Fatalf("private channel must publish its key: %v", sent)
 	}
 }
 

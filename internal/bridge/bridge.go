@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -182,6 +183,9 @@ func (b *Bridge) syncTopics() {
 	b.mu.Unlock()
 
 	for idx, name := range channels {
+		if _, secret, err := b.r.QueryChannel(idx); err == nil {
+			b.normalizePublicChannel(idx, name, secret)
+		}
 		b.topics.ensure(channelKey(idx), name, b.tg)
 		time.Sleep(250 * time.Millisecond) // Telegram rate-limits topic creation
 	}
@@ -310,6 +314,55 @@ func (b *Bridge) targetFromThread(m *telegram.Message) (target, bool) {
 	return target{}, false
 }
 
+// meshcorePublicPSK — стандартный ключ канала Public (base64
+// "izOH6cXN6mrJ5e26oRXNcg==", как в main_companion.cpp).
+var meshcorePublicPSK = [16]byte{
+	0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
+	0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
+}
+
+// channelSecret — секрет по соглашению MeshCore-приложения:
+// "#имя" — публичный: ключ выводится из имени (sha256(name)[:16]), канал
+// добавляется по имени без обмена ключами; имя "Public" — стандартный
+// константный ключ; иначе — случайный (приватный, ключ раздаётся).
+func channelSecret(name string) [16]byte {
+	var s [16]byte
+	if strings.HasPrefix(name, "#") {
+		sum := sha256.Sum256([]byte(name))
+		copy(s[:], sum[:16])
+		return s
+	}
+	if name == "Public" {
+		return meshcorePublicPSK
+	}
+	if _, err := rand.Read(s[:]); err != nil {
+		log.Printf("topics: secret for %q: %v", name, err)
+	}
+	return s
+}
+
+// normalizePublicChannel приводит ключ #-канала к выводному из имени,
+// если он был создан с другим (например, со случайным).
+func (b *Bridge) normalizePublicChannel(idx byte, name string, secret [16]byte) {
+	if !strings.HasPrefix(name, "#") {
+		return
+	}
+	want := channelSecret(name)
+	if secret == want {
+		return
+	}
+	if err := b.r.SetChannel(idx, name, want); err != nil {
+		log.Printf("topics: normalize %q: %v", name, err)
+		return
+	}
+	log.Printf("topics: channel %q key set to the name-derived public key", name)
+	thread, _ := b.topics.thread(channelKey(idx))
+	if err := b.tg.SendMessage(fmt.Sprintf("🔑 ключ канала «%s» приведён к публичному "+
+		"(добавляется по имени)", name), thread); err != nil {
+		log.Printf("telegram: %v", err)
+	}
+}
+
 // linkTopic binds a Telegram topic to a mesh channel: reuses a channel with
 // that name, or creates one on the radio (random secret, published in the
 // topic so it can be shared with the channel members).
@@ -326,13 +379,14 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 	idx := -1
 	fresh := map[byte]string{}
 	for i := 0; i < maxChannelSlots; i++ {
-		n, _, err := b.r.QueryChannel(byte(i))
+		n, secret, err := b.r.QueryChannel(byte(i))
 		if err != nil || n == "" {
 			continue
 		}
 		fresh[byte(i)] = n
 		if strings.EqualFold(n, name) && idx < 0 {
 			idx = i
+			b.normalizePublicChannel(byte(i), n, secret)
 		}
 	}
 	b.info.Channels = fresh
@@ -350,20 +404,20 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 	}
 
 	if fresh[byte(idx)] == "" {
-		// у каждого канала свой ключ: общий Public-ключ даёт один и тот же
-		// канал в эфире (хеш = sha256(секрета)) — сообщения падают в Public
-		var secret [16]byte
-		if _, err := rand.Read(secret[:]); err != nil {
-			log.Printf("topics: secret for %q: %v", name, err)
-			return false
-		}
+		secret := channelSecret(name)
 		if err := b.r.SetChannel(byte(idx), name, secret); err != nil {
 			log.Printf("topics: create channel %q: %v", name, err)
 			return false
 		}
 		b.info.Channels[byte(idx)] = name
-		msg := fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\nКлюч: %x",
-			name, idx, secret)
+		var msg string
+		if strings.HasPrefix(name, "#") || name == "Public" {
+			msg = fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\n"+
+				"Публичный: добавляется по имени в приложении", name, idx)
+		} else {
+			msg = fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\nКлюч: %x",
+				name, idx, secret)
+		}
 		if err := b.tg.SendMessage(msg, threadID); err != nil {
 			log.Printf("telegram: %v", err)
 		}
