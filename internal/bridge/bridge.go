@@ -26,6 +26,11 @@ var heardCheckDelay = 5 * time.Second
 const (
 	maxNameLen      = 32 // sender name budget before it eats the mesh text
 	maxChannelSlots = 8  // group channel slots on the radio
+	// вкладки пробуются по thread_id (Bot API не даёт список тем): id идут
+	// вслед за id сообщений группы, поэтому ограниченный обход с обрывом
+	// после серии промахов покрывает обычные группы
+	topicProbeMax    = 300
+	topicProbeMisses = 30
 )
 
 // radio is the mesh side the bridge needs; *companion.Client implements it.
@@ -46,6 +51,7 @@ type Telegram interface {
 	ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	CreateForumTopic(name string) (int64, error)
 	GetForumTopic(threadID int64) (string, error)
+	ListForumTopics(maxThreadID, maxMisses int64) map[string]int64
 }
 
 // target is one mesh endpoint and its Telegram topic.
@@ -153,20 +159,62 @@ func New(tg Telegram, topicsFile string) *Bridge {
 	return &Bridge{tg: tg, topics: loadTopics(topicsFile)}
 }
 
-// Attach implements companion.Hooks: remembers the session and makes sure
-// every channel has its topic.
+// Attach implements companion.Hooks: remembers the session and syncs the
+// topics with the group.
 func (b *Bridge) Attach(c *companion.Client, info companion.SessionInfo) {
 	b.mu.Lock()
 	b.r, b.info = c, info
 	b.mu.Unlock()
 
-	for idx, name := range info.Channels {
-		if _, secret, err := c.QueryChannel(idx); err == nil {
+	b.syncTopics()
+}
+
+// syncTopics: существующие вкладки привязываются по имени, недостающие —
+// создаются; ключи #-каналов приводятся к стандартному Public.
+func (b *Bridge) syncTopics() {
+	b.bindExistingTopics()
+
+	b.mu.Lock()
+	channels := make(map[byte]string, len(b.info.Channels))
+	for idx, name := range b.info.Channels {
+		channels[idx] = name
+	}
+	b.mu.Unlock()
+
+	for idx, name := range channels {
+		if _, secret, err := b.r.QueryChannel(idx); err == nil {
 			b.normalizePublicChannel(idx, name, secret)
 		}
 		b.topics.ensure(channelKey(idx), name, b.tg)
 		time.Sleep(250 * time.Millisecond) // Telegram rate-limits topic creation
 	}
+}
+
+// bindExistingTopics привязывает существующие вкладки группы к каналам и
+// контактам по имени — чтобы после потери topics.json не плодить дубликаты.
+func (b *Bridge) bindExistingTopics() {
+	existing := b.tg.ListForumTopics(topicProbeMax, topicProbeMisses)
+	if len(existing) == 0 {
+		return
+	}
+	byName := map[string]int64{}
+	for name, id := range existing {
+		byName[strings.ToLower(name)] = id
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for idx, name := range b.info.Channels {
+		if id, ok := byName[strings.ToLower(name)]; ok {
+			b.topics.bind(channelKey(idx), id)
+		}
+	}
+	for prefix, name := range b.info.Contacts {
+		if id, ok := byName[strings.ToLower(name)]; ok {
+			b.topics.bind(dmKey(prefix), id)
+		}
+	}
+	log.Printf("topics: group has %d вкладок, привязано по имени", len(existing))
 }
 
 // Detach implements companion.Hooks.

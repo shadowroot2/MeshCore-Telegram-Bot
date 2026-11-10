@@ -116,6 +116,24 @@ func (c *Client) GetForumTopic(threadID int64) (string, error) {
 	return res.Name, nil
 }
 
+// ListForumTopics returns {name: threadID} for the вкладки that exist in the
+// group. The Bot API has no topic listing, so thread ids are probed: they
+// follow the group's message ids, so a streak of misses means the end.
+func (c *Client) ListForumTopics(maxThreadID, maxMisses int64) map[string]int64 {
+	found := map[string]int64{}
+	misses := int64(0)
+	for id := int64(2); id <= maxThreadID && misses < maxMisses; id++ {
+		name, err := c.GetForumTopic(id)
+		if err != nil || name == "" {
+			misses++
+			continue
+		}
+		misses = 0
+		found[name] = id
+	}
+	return found
+}
+
 // postRetryDelay is a var so tests can shorten it.
 var postRetryDelay = 2 * time.Second
 

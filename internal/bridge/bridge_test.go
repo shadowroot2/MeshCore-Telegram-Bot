@@ -109,6 +109,7 @@ type stubTG struct {
 	nextID      int64
 	topicFailN  int // fail this many CreateForumTopic calls first
 	threadNames map[int64]string
+	listed      map[string]int64 // имя вкладки -> thread id для ListForumTopics
 }
 
 func (s *stubTG) ChatID() int64 { return -100500 }
@@ -127,6 +128,16 @@ func (s *stubTG) ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	defer s.mu.Unlock()
 	s.replies = append(s.replies, outReply{threadID, replyToMsgID, text})
 	return nil
+}
+
+func (s *stubTG) ListForumTopics(maxThreadID, maxMisses int64) map[string]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]int64{}
+	for k, v := range s.listed {
+		out[k] = v
+	}
+	return out
 }
 
 func (s *stubTG) GetForumTopic(threadID int64) (string, error) {
@@ -675,5 +686,43 @@ func TestLinkTopicPrivateChannelGetsRandomKey(t *testing.T) {
 	sent, _, _ := tg.log()
 	if len(sent) != 1 || !strings.Contains(sent[0].text, "Ключ:") {
 		t.Fatalf("private channel must publish its key: %v", sent)
+	}
+}
+
+func TestSyncTopicsReusesExistingBy(t *testing.T) {
+	// topics.json потерян, но вкладки в группе уже есть
+	r := &stubRadio{chNames: map[byte]string{0: "Public", 1: "Other"}}
+	tg := &stubTG{listed: map[string]int64{"Public": 10, "other": 12, "Валера": 14}}
+	b := newTestBridge(t, tg, r)
+	b.info.Contacts = map[[6]byte]string{{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}: "Валера"}
+
+	b.syncTopics()
+
+	sent, _, created := tg.log()
+	if len(created) != 0 {
+		t.Fatalf("existing topics must be reused, created %v", created)
+	}
+	// привязка по имени (без учёта регистра) сохранилась в topics.json
+	for key, want := range map[string]int64{"ch:0": 10, "ch:1": 12,
+		"dm:deadbeef0001": 14} {
+		if got, ok := b.topics.thread(key); !ok || got != want {
+			t.Fatalf("binding %s = %d %v, want %d", key, got, ok, want)
+		}
+	}
+	if len(sent) != 0 {
+		t.Fatalf("no notices expected, got %v", sent)
+	}
+}
+
+func TestSyncTopicsCreatesMissingOnly(t *testing.T) {
+	r := &stubRadio{chNames: map[byte]string{0: "Public", 1: "Other"}}
+	tg := &stubTG{listed: map[string]int64{"Public": 10}}
+	b := newTestBridge(t, tg, r)
+
+	b.syncTopics()
+
+	_, _, created := tg.log()
+	if len(created) != 1 || created[0] != "Other" {
+		t.Fatalf("only the missing topic must be created: %v", created)
 	}
 }
