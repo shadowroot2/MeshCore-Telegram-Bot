@@ -971,3 +971,43 @@ func TestAnnounceRetriesAfterFailure(t *testing.T) {
 		t.Fatalf("announcement must be retried after a failure, got %d sends", len(sent))
 	}
 }
+
+func TestEnsureKeepsUserRenamedTopic(t *testing.T) {
+	tg := &stubTG{}
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
+	// вкладку назвали вручную — бот не должен перетирать имя
+	b.topics.bind("ch:0", 10, "Мой друг")
+
+	id := b.topics.ensure("ch:0", "Валера", tg)
+	if id != 10 {
+		t.Fatalf("id = %d, want 10", id)
+	}
+	if len(tg.renames) != 0 {
+		t.Fatalf("user-renamed topic must be left alone: %v", tg.renames)
+	}
+	_, _, created := tg.log()
+	if len(created) != 0 {
+		t.Fatalf("no new topics expected: %v", created)
+	}
+}
+
+func TestBindExistingFollowsUserRename(t *testing.T) {
+	tg := &stubTG{listed: map[string]int64{"Мой друг": 10}}
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
+	b.info = companion.SessionInfo{Channels: map[byte]string{0: "Public"},
+		Contacts: map[[6]byte]string{}, DefaultIdx: 0}
+	// наш маппинг: вкладка 10 раньше называлась Public
+	b.topics.bind("ch:0", 10, "Public")
+
+	b.bindExistingTopics()
+
+	// имя принято из TG (ручной ренейм), ensure его не тронет
+	b.topics.ensure("ch:0", "Public", tg)
+	if len(tg.renames) != 0 {
+		t.Fatalf("rename must not fight the user: %v", tg.renames)
+	}
+	e := b.topics.snapshot()["ch:0"]
+	if e.Name != "Мой друг" {
+		t.Fatalf("stored name = %q, want «Мой друг»", e.Name)
+	}
+}

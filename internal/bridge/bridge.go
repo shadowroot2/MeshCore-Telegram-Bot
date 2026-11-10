@@ -109,6 +109,16 @@ func loadTopics(path string) *topics {
 	return t
 }
 
+func (t *topics) snapshot() map[string]topicEntry {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]topicEntry, len(t.byKey))
+	for k, e := range t.byKey {
+		out[k] = e
+	}
+	return out
+}
+
 func (t *topics) thread(key string) (int64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -173,6 +183,13 @@ func (t *topics) bind(key string, thread int64, name string) {
 	}
 }
 
+// isFallbackName — имена, придуманные самим ботом; только их он имеет право
+// переименовывать (dm-xxxx до узнавания контакта, channel-N). Вкладки,
+// названные вручную, бот не трогает.
+func isFallbackName(name string) bool {
+	return strings.HasPrefix(name, "dm-") || strings.HasPrefix(name, "channel-")
+}
+
 // ensure returns the topic for key, creating it once; 0 means General.
 // Creation is retried: Telegram rate-limits topic creation, and a failed
 // attempt would otherwise park the whole topic in General forever. If the
@@ -182,7 +199,7 @@ func (t *topics) ensure(key, name string, tg Telegram) int64 {
 	t.mu.Lock()
 	e, ok := t.byKey[key]
 	t.mu.Unlock()
-	if ok && e.Name == name {
+	if ok && (e.Name == name || !isFallbackName(e.Name)) {
 		return e.ID
 	}
 	if ok {
@@ -314,23 +331,39 @@ func (b *Bridge) bindExistingTopics() {
 		return
 	}
 	byName := map[string]int64{}
+	byID := map[int64]string{}
 	for name, id := range existing {
 		byName[strings.ToLower(name)] = id
+		byID[id] = name
+	}
+
+	// сперва по сохранённому id: вкладку могли переименовать вручную в TG,
+	// её имя принимаем как есть — бот его не перетирает
+	for key, e := range b.topics.snapshot() {
+		if tgName, ok := byID[e.ID]; ok && tgName != e.Name {
+			log.Printf("topics: %q renamed in Telegram to %q, following", e.Name, tgName)
+			b.topics.bind(key, e.ID, tgName)
+		}
 	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for idx, name := range b.info.Channels {
+		if _, known := b.topics.thread(channelKey(idx)); known {
+			continue
+		}
 		if id, ok := byName[strings.ToLower(name)]; ok {
 			b.topics.bind(channelKey(idx), id, name)
 		}
 	}
 	for prefix, name := range b.info.Contacts {
+		if _, known := b.topics.thread(dmKey(prefix)); known {
+			continue
+		}
 		if id, ok := byName[strings.ToLower(name)]; ok {
 			b.topics.bind(dmKey(prefix), id, name)
 		}
 	}
-	// DM-вкладки с fallback-именем (dm-xxxx) тоже найдутся по имени контакта
 	log.Printf("topics: group has %d вкладок, привязано по имени", len(existing))
 }
 
@@ -371,17 +404,23 @@ func (b *Bridge) Deliver(m companion.Message) error {
 // перечитывает список контактов радио — авто-добавленные узнают имена из
 // advert'ов не сразу, и снапшот со старта сессии их ещё не содержит.
 func (b *Bridge) contactName(prefix [6]byte) string {
+	b.mu.Lock()
 	if n := b.info.Contacts[prefix]; n != "" {
+		b.mu.Unlock()
 		return n
 	}
-	if b.r == nil {
+	r := b.r
+	b.mu.Unlock()
+	if r == nil {
 		return ""
 	}
-	list, err := b.r.Contacts()
+	list, err := r.Contacts()
 	if err != nil {
 		log.Printf("contacts: %v", err)
 		return ""
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for p, n := range list {
 		b.info.Contacts[p] = n
 	}
@@ -389,8 +428,6 @@ func (b *Bridge) contactName(prefix [6]byte) string {
 }
 
 func (b *Bridge) targetFor(m companion.Message) target {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	if m.Kind == companion.KindDM {
 		name := b.contactName(m.Prefix)
 		if name == "" {
@@ -403,12 +440,17 @@ func (b *Bridge) targetFor(m companion.Message) target {
 			name:   name,
 		}
 	}
+	b.mu.Lock()
 	name := b.info.Channels[m.ChannelIdx]
-	if name == "" && b.r != nil {
+	r := b.r
+	b.mu.Unlock()
+	if name == "" && r != nil {
 		// канал мог появиться после старта сессии — спросим радио
-		if n, _, err := b.r.QueryChannel(m.ChannelIdx); err == nil && n != "" {
+		if n, _, err := r.QueryChannel(m.ChannelIdx); err == nil && n != "" {
 			name = n
+			b.mu.Lock()
 			b.info.Channels[m.ChannelIdx] = n
+			b.mu.Unlock()
 		}
 	}
 	if name == "" {
@@ -497,7 +539,13 @@ func (b *Bridge) normalizePublicChannel(idx byte, name string, secret [16]byte) 
 	if secret == want {
 		return
 	}
-	if err := b.r.SetChannel(idx, name, want); err != nil {
+	b.mu.Lock()
+	r := b.r
+	b.mu.Unlock()
+	if r == nil {
+		return
+	}
+	if err := r.SetChannel(idx, name, want); err != nil {
 		log.Printf("topics: normalize %q: %v", name, err)
 		return
 	}
@@ -514,8 +562,9 @@ func (b *Bridge) normalizePublicChannel(idx byte, name string, secret [16]byte) 
 // topic so it can be shared with the channel members).
 func (b *Bridge) linkTopic(threadID int64, name string) bool {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.r == nil {
+	r := b.r
+	b.mu.Unlock()
+	if r == nil {
 		log.Printf("topics: radio offline, cannot link %q", name)
 		return false
 	}
@@ -525,7 +574,7 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 	idx := -1
 	fresh := map[byte]string{}
 	for i := 0; i < maxChannelSlots; i++ {
-		n, secret, err := b.r.QueryChannel(byte(i))
+		n, secret, err := r.QueryChannel(byte(i))
 		if err != nil || n == "" {
 			continue
 		}
@@ -535,7 +584,9 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 			b.normalizePublicChannel(byte(i), n, secret)
 		}
 	}
+	b.mu.Lock()
 	b.info.Channels = fresh
+	b.mu.Unlock()
 	if idx < 0 {
 		for i := 0; i < maxChannelSlots; i++ {
 			if _, taken := fresh[byte(i)]; !taken {
@@ -551,11 +602,13 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 
 	if fresh[byte(idx)] == "" {
 		secret := channelSecret(name)
-		if err := b.r.SetChannel(byte(idx), name, secret); err != nil {
+		if err := r.SetChannel(byte(idx), name, secret); err != nil {
 			log.Printf("topics: create channel %q: %v", name, err)
 			return false
 		}
+		b.mu.Lock()
 		b.info.Channels[byte(idx)] = name
+		b.mu.Unlock()
 		var msg string
 		if strings.HasPrefix(name, "#") || name == "Public" {
 			msg = fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\n"+
@@ -589,14 +642,17 @@ func (b *Bridge) linkTopicFromTG(threadID int64) bool {
 
 func (b *Bridge) sendTo(t target, text string, ts uint32) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.r == nil {
+	r := b.r
+	b.mu.Unlock()
+	if r == nil {
 		return errors.New("radio offline")
 	}
+	// клиент радио потокобезопасен, долгий I/O не держит b.mu — иначе
+	// встречный поток (mesh->TG) стоит по 15 секунд на каждый запрос
 	if t.kind == companion.KindDM {
-		return b.r.SendContactText(t.prefix, text, ts)
+		return r.SendContactText(t.prefix, text, ts)
 	}
-	return b.r.SendChannelText(t.channel, text, ts)
+	return r.SendChannelText(t.channel, text, ts)
 }
 
 // tssFor выдаёт стабильные timestamp'ы для сообщения: при повторе (offset не
@@ -636,11 +692,12 @@ func (b *Bridge) tssDone(id int64) {
 // reply (e.g. a firmware without `send.heard`) is reported as -1.
 func (b *Bridge) HeardCount(ts uint32) (int, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.r == nil {
+	r := b.r
+	b.mu.Unlock()
+	if r == nil {
 		return 0, errors.New("radio offline")
 	}
-	reply, err := b.r.RunCLI(fmt.Sprintf("send.heard %d", ts))
+	reply, err := r.RunCLI(fmt.Sprintf("send.heard %d", ts))
 	if err != nil {
 		return 0, err
 	}
