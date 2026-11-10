@@ -1,9 +1,6 @@
 services:
   meshcore-telegram-bot:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: meshcore-telegram-bot
+    image: dmtrigub/meshcore-telegram-bot:latest
     container_name: meshcore-telegram-bot
     restart: unless-stopped
     environment:

@@ -21,7 +21,7 @@ docker-build:
 	docker build -f docker/Dockerfile -t meshcore-telegram-bot .
 
 docker-up:
-	docker compose -f docker/docker-compose.yml up -d --build
+	docker compose -f docker/docker-compose.yml up -d
 
 docker-down:
 	docker compose -f docker/docker-compose.yml down

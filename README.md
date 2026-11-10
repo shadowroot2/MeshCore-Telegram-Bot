@@ -86,12 +86,12 @@ make build
 make run        # или ./bin/meshcore-telegram-bot
 ```
 
-В Docker — сборка идёт в отдельном контейнере (multi-stage: `golang:1.27-alpine`
-собирает бинарник, рантайм — `alpine:3.20` с CA-сертификатами, от непривилегированного
-пользователя):
+В Docker образ качается с Docker Hub (`dmtrigub/meshcore-telegram-bot:latest`);
+собирается он multi-stage в отдельном контейнере (`golang:1.27-alpine` → `alpine:3.20`
+с CA-сертификатами, от непривилегированного пользователя):
 
 ```bash
-make docker-up  # docker compose -f docker/docker-compose.yml up -d --build
+make docker-up  # docker compose -f docker/docker-compose.yml up -d
 ```
 
 Конфиг монтируется в контейнер read-only (`../.env:/app/.env`) в образ не попадает.

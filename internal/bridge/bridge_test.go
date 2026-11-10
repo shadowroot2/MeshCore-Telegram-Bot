@@ -182,7 +182,7 @@ func TestProcessUpdatesRoutesByTopic(t *testing.T) {
 	heardCheckDelay = 5 * time.Millisecond
 	defer func() { heardCheckDelay = oldDelay }()
 
-	r := &stubRadio{}
+	r := &stubRadio{reply: "> 2"}
 	tg := &stubTG{}
 	b := newTestBridge(t, tg, r)
 
@@ -216,18 +216,27 @@ func TestProcessUpdatesRoutesByTopic(t *testing.T) {
 		t.Fatalf("dm sends %v", dm)
 	}
 
-	// heard-count только для канального сообщения (id 12)
+	// heard-count уходит обеим канальным отправкам (General и Other), DM — без него
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		_, replies, _ := tg.log()
-		if len(replies) > 0 {
-			if replies[0].to != 12 || replies[0].thread != chThread {
-				t.Fatalf("heard reply %v", replies[0])
+		found := false
+		for _, rep := range replies {
+			if rep.to == 12 {
+				found = true
+				if rep.thread != chThread || rep.text != "2 репиттера услышали" {
+					t.Fatalf("heard reply %v", rep)
+				}
 			}
+			if rep.to == 13 {
+				t.Fatalf("DM must not get a heard reply: %v", rep)
+			}
+		}
+		if found {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("no heard-count reply arrived")
+			t.Fatalf("no heard-count reply for message 12: %v", replies)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
