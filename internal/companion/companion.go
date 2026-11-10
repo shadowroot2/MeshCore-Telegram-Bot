@@ -91,6 +91,8 @@ type Message struct {
 // channel by index, every contact name by pubkey prefix, and the index of
 // the default channel (routing fallback).
 type SessionInfo struct {
+	NodeName   string // имя радио из SELF_INFO
+	Addr       string // куда подключались (RADIO_ADDR)
 	Channels   map[byte]string
 	Contacts   map[[contactPrefixLen]byte]string
 	DefaultIdx byte
@@ -344,6 +346,8 @@ func Session(addr, defaultChannel string, hooks Hooks, deliver func(Message) err
 	log.Printf("radio: connected to %q", name)
 
 	info := SessionInfo{Contacts: map[[contactPrefixLen]byte]string{}}
+	info.NodeName = name
+	info.Addr = addr
 	if err := c.resolveChannels(&info, defaultChannel); err != nil {
 		return err
 	}

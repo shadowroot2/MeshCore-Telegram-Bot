@@ -910,3 +910,33 @@ func TestEnsureRecreatesWhenRenameFindsDeleted(t *testing.T) {
 		t.Fatalf("recreated with the contact name: %v", created)
 	}
 }
+
+func TestAnnounceToPublicOnce(t *testing.T) {
+	tg := &stubTG{}
+	r := &stubRadio{chNames: map[byte]string{0: "Public"}}
+	b := newTestBridge(t, tg, r)
+	b.topics.bind(channelKey(0), 10, "Public")
+
+	info := companion.SessionInfo{
+		NodeName:   "✈ ShadoW TG",
+		Addr:       "192.168.1.50:5000",
+		Channels:   map[byte]string{0: "Public", 1: "Other", 2: "#zephcore", 3: "#sos"},
+		Contacts:   map[[6]byte]string{{1}: "Валера", {2}: "Пётр"},
+		DefaultIdx: 0,
+	}
+
+	b.announce(info)
+	b.announce(info) // повторно — не спамим
+
+	sent, _, _ := tg.log()
+	if len(sent) != 1 {
+		t.Fatalf("want exactly one announcement, got %d", len(sent))
+	}
+	want := "🚀 MeshCore bot запущен и подключен к «✈ ShadoW TG» (192.168.1.50:5000) · каналов: 4 · контактов: 2"
+	if sent[0].text != want {
+		t.Fatalf("got %q, want %q", sent[0].text, want)
+	}
+	if sent[0].thread != 10 {
+		t.Fatalf("announcement must go to the Public topic, got thread %d", sent[0].thread)
+	}
+}

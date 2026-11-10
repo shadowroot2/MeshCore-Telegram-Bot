@@ -227,7 +227,8 @@ type Bridge struct {
 	lastTs  uint32
 	retryTs map[int64][]uint32 // стабильные ts для повторных отправок
 
-	tz *time.Location // пояс из TZ_OFFSET конфига
+	tz        *time.Location // пояс из TZ_OFFSET конфига
+	announced bool           // стартовое сообщение уже ушло
 }
 
 func New(tg Telegram, topicsFile string, tzHours float64) *Bridge {
@@ -246,6 +247,33 @@ func (b *Bridge) Attach(c *companion.Client, info companion.SessionInfo) {
 	b.mu.Unlock()
 
 	b.syncTopics()
+	b.announce(info)
+}
+
+// announce — приветствие в вкладку Public при первом подключении (только
+// в Telegram; в mesh ничего не уходит).
+func (b *Bridge) announce(info companion.SessionInfo) {
+	b.mu.Lock()
+	if b.announced {
+		b.mu.Unlock()
+		return
+	}
+	b.announced = true
+	b.mu.Unlock()
+
+	thread := int64(0) // General как запасной вариант
+	for idx, name := range info.Channels {
+		if name == "Public" {
+			if id, ok := b.topics.thread(channelKey(idx)); ok {
+				thread = id
+			}
+		}
+	}
+	text := fmt.Sprintf("🚀 MeshCore bot запущен и подключен к «%s» (%s) · каналов: %d · контактов: %d",
+		info.NodeName, info.Addr, len(info.Channels), len(info.Contacts))
+	if err := b.tg.SendMessage(text, thread); err != nil {
+		log.Printf("telegram: %v", err)
+	}
 }
 
 // location — пояс для шапок сообщений (TZ_OFFSET из конфига).
