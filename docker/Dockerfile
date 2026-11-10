@@ -16,12 +16,14 @@ RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" \
 
 FROM alpine:3.20
 
-# CA-сертификаты: Telegram API по HTTPS
-RUN apk add --no-cache ca-certificates \
+# CA-сертификаты: Telegram API по HTTPS; su-exec — сброс привилегий после chown
+RUN apk add --no-cache ca-certificates su-exec \
 	&& adduser -D -u 10001 bot
 
 WORKDIR /app
 COPY --from=build /out/meshcore-telegram-bot .
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-USER bot
-ENTRYPOINT ["/app/meshcore-telegram-bot"]
+# entrypoint стартует от root, делает chown /app/data и переходит на bot
+ENTRYPOINT ["/entrypoint.sh"]

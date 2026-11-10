@@ -70,6 +70,7 @@ func loadTopics(path string) *topics {
 	t := &topics{path: path, byKey: map[string]int64{}, byID: map[int64]string{}}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		log.Printf("topics: %s: %v (start empty — все темы будут созданы заново)", path, err)
 		return t
 	}
 	var raw map[string]int64
@@ -80,6 +81,7 @@ func loadTopics(path string) *topics {
 	for k, id := range raw {
 		t.byKey[k], t.byID[id] = id, k
 	}
+	log.Printf("topics: %s: %d mappings loaded", path, len(t.byKey))
 	return t
 }
 
@@ -111,7 +113,7 @@ func (t *topics) bind(key string, thread int64) {
 		err = os.WriteFile(t.path, data, 0o600)
 	}
 	if err != nil {
-		log.Printf("topics: save %s: %v", t.path, err)
+		log.Printf("topics: save %s: %v (маппинг не переживёт перезапуск!)", t.path, err)
 	}
 }
 
