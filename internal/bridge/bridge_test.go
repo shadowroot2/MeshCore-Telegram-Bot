@@ -27,32 +27,28 @@ type stubRadio struct {
 	chSecrets  map[byte][16]byte
 	setCalls   []string // имена, созданные через SetChannel
 	setSecrets [][16]byte
+	sentTs     []uint32 // timestamp'ы отправок
 	reply      string
 	replyEr    error
 	sendErr    error
 	ts         uint32
 }
 
-func (s *stubRadio) SendChannelText(idx byte, text string) (uint32, error) {
+func (s *stubRadio) SendChannelText(idx byte, text string, ts uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sendErr != nil {
-		return 0, s.sendErr
-	}
+	// запись до ошибки: пакет уходит в эфир, теряется только ack
 	s.chSent = append(s.chSent, text)
-	s.ts++
-	return s.ts, nil
+	s.sentTs = append(s.sentTs, ts)
+	return s.sendErr
 }
 
-func (s *stubRadio) SendContactText(prefix [6]byte, text string) (uint32, error) {
+func (s *stubRadio) SendContactText(prefix [6]byte, text string, ts uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sendErr != nil {
-		return 0, s.sendErr
-	}
 	s.dmSent = append(s.dmSent, text)
-	s.ts++
-	return s.ts, nil
+	s.sentTs = append(s.sentTs, ts)
+	return s.sendErr
 }
 
 func (s *stubRadio) QueryChannel(idx byte) (string, [16]byte, error) {
@@ -735,5 +731,37 @@ func TestSyncTopicsCreatesMissingOnly(t *testing.T) {
 	_, _, created := tg.log()
 	if len(created) != 1 || created[0] != "Other" {
 		t.Fatalf("only the missing topic must be created: %v", created)
+	}
+}
+
+func TestRetryReusesTimestamp(t *testing.T) {
+	r := &stubRadio{}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+
+	updates := []telegram.Update{
+		{UpdateID: 7, Message: &telegram.Message{MessageID: 11, Text: "цитата",
+			Chat: telegram.Chat{ID: -100500}, From: telegram.From{ID: 1, FirstName: "А"}}},
+	}
+
+	// первая попытка падает после отправки (ack потерян) — offset не двигается
+	r.sendErr = errors.New("radio ack timeout")
+	if next := processUpdates(b, 0, updates); next != 0 {
+		t.Fatalf("offset = %d, want 0", next)
+	}
+	// повтор успешен — обязан уйти с тем же ts, чтобы mesh схлопнул дубль
+	r.mu.Lock()
+	r.sendErr = nil
+	r.mu.Unlock()
+	if next := processUpdates(b, 0, updates); next != 8 {
+		t.Fatalf("offset = %d, want 8", next)
+	}
+
+	ts := r.sentTs
+	if len(ts) != 2 {
+		t.Fatalf("expected 2 sends (retry), got %d", len(ts))
+	}
+	if ts[0] != ts[1] {
+		t.Fatalf("retry must reuse the timestamp: %d vs %d", ts[0], ts[1])
 	}
 }

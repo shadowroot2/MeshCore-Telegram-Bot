@@ -112,8 +112,6 @@ type Client struct {
 	rmu  sync.Mutex  // guards resp
 	resp chan []byte // ack of an in-flight request, nil when idle
 
-	tsMu   sync.Mutex // guards lastTs
-	lastTs uint32
 }
 
 func Dial(addr string) (*Client, error) {
@@ -147,7 +145,7 @@ func (c *Client) request(payload []byte, want ...byte) ([]byte, error) {
 	c.reqM.Lock()
 	defer c.reqM.Unlock()
 
-	ack := make(chan []byte, 1)
+	ack := make(chan []byte, 4)
 	c.rmu.Lock()
 	c.resp = ack
 	c.rmu.Unlock()
@@ -176,24 +174,12 @@ func (c *Client) request(payload []byte, want ...byte) ([]byte, error) {
 	}
 }
 
-// nextTs is a strictly increasing message timestamp: two sends in the same
-// wall-clock second would otherwise share a ts and collide in `send.heard`.
-func (c *Client) nextTs() uint32 {
-	c.tsMu.Lock()
-	defer c.tsMu.Unlock()
-	ts := uint32(time.Now().Unix())
-	if ts <= c.lastTs {
-		ts = c.lastTs + 1
-	}
-	c.lastTs = ts
-	return ts
-}
-
-// SendChannelText posts to a mesh channel and waits for the radio's OK/ERROR
-// ack. Returns the message timestamp used, which `send.heard <ts>` keys on.
-func (c *Client) SendChannelText(idx byte, text string) (uint32, error) {
+// SendChannelText posts to a mesh channel with the caller's message timestamp
+// and waits for the radio's OK/ERROR ack. Retries must reuse the same ts:
+// identical payload means an identical packet, which mesh dedup drops, so a
+// resent message is not delivered twice. The ts keys `send.heard <ts>`.
+func (c *Client) SendChannelText(idx byte, text string, ts uint32) error {
 	text = Truncate(text, MaxChannelText)
-	ts := c.nextTs()
 	payload := make([]byte, 7+len(text))
 	payload[0] = cmdSendChannelTxtMsg
 	payload[1] = txtTypePlain
@@ -203,19 +189,18 @@ func (c *Client) SendChannelText(idx byte, text string) (uint32, error) {
 
 	f, err := c.request(payload, pktOK, pktError)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if f[0] != pktOK {
-		return 0, radioErr("send", f)
+		return radioErr("send", f)
 	}
-	return ts, nil
+	return nil
 }
 
-// SendContactText sends a DM to a contact by pubkey prefix and waits for the
-// radio's PACKET_SENT ack.
-func (c *Client) SendContactText(prefix [contactPrefixLen]byte, text string) (uint32, error) {
+// SendContactText sends a DM to a contact by pubkey prefix with the caller's
+// timestamp and waits for the radio's PACKET_SENT ack. Retries must reuse ts.
+func (c *Client) SendContactText(prefix [contactPrefixLen]byte, text string, ts uint32) error {
 	text = Truncate(text, MaxDMText)
-	ts := c.nextTs()
 	payload := make([]byte, 13+len(text))
 	payload[0] = cmdSendTxtMsg
 	payload[1] = txtTypePlain
@@ -226,12 +211,12 @@ func (c *Client) SendContactText(prefix [contactPrefixLen]byte, text string) (ui
 
 	f, err := c.request(payload, pktSent, pktError)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if f[0] != pktSent {
-		return 0, radioErr("DM send", f)
+		return radioErr("DM send", f)
 	}
-	return ts, nil
+	return nil
 }
 
 // QueryChannel returns the name and 16-byte secret of a channel slot.

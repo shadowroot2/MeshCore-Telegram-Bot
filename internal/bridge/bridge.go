@@ -36,8 +36,8 @@ const (
 
 // radio is the mesh side the bridge needs; *companion.Client implements it.
 type radio interface {
-	SendChannelText(idx byte, text string) (uint32, error)
-	SendContactText(prefix [6]byte, text string) (uint32, error)
+	SendChannelText(idx byte, text string, ts uint32) error
+	SendContactText(prefix [6]byte, text string, ts uint32) error
 	QueryChannel(idx byte) (string, [16]byte, error)
 	SetChannel(idx byte, name string, secret [16]byte) error
 	RunCLI(line string) (string, error)
@@ -154,6 +154,10 @@ type Bridge struct {
 	info   companion.SessionInfo
 	tg     Telegram
 	topics *topics
+
+	tsMu    sync.Mutex
+	lastTs  uint32
+	retryTs map[int64][]uint32 // стабильные ts для повторных отправок
 }
 
 func New(tg Telegram, topicsFile string) *Bridge {
@@ -441,16 +445,48 @@ func (b *Bridge) linkTopicFromTG(threadID int64) bool {
 	return b.linkTopic(threadID, name)
 }
 
-func (b *Bridge) sendTo(t target, text string) (uint32, error) {
+func (b *Bridge) sendTo(t target, text string, ts uint32) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.r == nil {
-		return 0, errors.New("radio offline")
+		return errors.New("radio offline")
 	}
 	if t.kind == companion.KindDM {
-		return b.r.SendContactText(t.prefix, text)
+		return b.r.SendContactText(t.prefix, text, ts)
 	}
-	return b.r.SendChannelText(t.channel, text)
+	return b.r.SendChannelText(t.channel, text, ts)
+}
+
+// tssFor выдаёт стабильные timestamp'ы для сообщения: при повторе (offset не
+// сдвинулся) текст уходит с теми же ts — пакет байт-в-байт тот же, и mesh
+// дедуплицирует его, вместо дублей у получателей.
+func (b *Bridge) tssFor(id int64, n int) []uint32 {
+	b.tsMu.Lock()
+	defer b.tsMu.Unlock()
+	if b.retryTs == nil {
+		b.retryTs = map[int64][]uint32{}
+	}
+	tss := b.retryTs[id]
+	for len(tss) < n {
+		tss = append(tss, b.nextTsLocked())
+	}
+	b.retryTs[id] = tss
+	return tss[:n]
+}
+
+func (b *Bridge) nextTsLocked() uint32 {
+	ts := uint32(time.Now().Unix())
+	if ts <= b.lastTs {
+		ts = b.lastTs + 1
+	}
+	b.lastTs = ts
+	return ts
+}
+
+func (b *Bridge) tssDone(id int64) {
+	b.tsMu.Lock()
+	delete(b.retryTs, id)
+	b.tsMu.Unlock()
 }
 
 // HeardCount asks the radio how many neighbours repeated the flood for the
@@ -541,21 +577,21 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 			offset = u.UpdateID + 1
 			continue
 		}
-		var ts uint32
-		var err error
-		for _, chunk := range chunks {
-			ts, err = b.sendTo(tgt, chunk)
-			if err != nil {
-				// offset остаётся: Telegram доставит сообщение повторно
+		tss := b.tssFor(u.UpdateID, len(chunks))
+		for i, chunk := range chunks {
+			if err := b.sendTo(tgt, chunk, tss[i]); err != nil {
+				// offset остаётся: Telegram доставит сообщение повторно,
+				// а повтор пойдёт с теми же ts — mesh схлопнет дубли
 				log.Printf("mesh: %v, will retry %q", err, chunk)
 				return offset
 			}
 		}
+		b.tssDone(u.UpdateID)
 		offset = u.UpdateID + 1
 		if tgt.kind == companion.KindChannel {
 			// retransmit feedback only exists for channel floods; один ответ
 			// на всё сообщение — по последней части
-			go checkHeard(b, m, ts)
+			go checkHeard(b, m, tss[len(tss)-1])
 		}
 	}
 	return offset

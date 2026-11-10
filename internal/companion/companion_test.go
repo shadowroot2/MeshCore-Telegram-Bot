@@ -337,7 +337,7 @@ func TestSendChannelText(t *testing.T) {
 	h := startSession(t, startFakeRadio(t, sent, "> 2", false))
 	c, info := h.client()
 
-	if _, err := c.SendChannelText(info.DefaultIdx, "ping из telegram"); err != nil {
+	if err := c.SendChannelText(info.DefaultIdx, "ping из telegram", 1700000000); err != nil {
 		t.Fatalf("SendChannelText: %v", err)
 	}
 
@@ -356,7 +356,7 @@ func TestSendContactText(t *testing.T) {
 	h := startSession(t, startFakeRadio(t, sent, "> 2", false))
 	c, _ := h.client()
 
-	if _, err := c.SendContactText(testPrefix, "личка"); err != nil {
+	if err := c.SendContactText(testPrefix, "личка", 1700000000); err != nil {
 		t.Fatalf("SendContactText: %v", err)
 	}
 
@@ -400,10 +400,10 @@ func TestRequestFiltersStaleFrames(t *testing.T) {
 	h := startSession(t, startFakeRadio(t, nil, "> 2", true))
 	c, info := h.client()
 
-	if _, err := c.SendChannelText(info.DefaultIdx, "stale ok"); err != nil {
+	if err := c.SendChannelText(info.DefaultIdx, "stale ok", 1700000000); err != nil {
 		t.Fatalf("send must ignore the stale CLI reply: %v", err)
 	}
-	if _, err := c.SendContactText(testPrefix, "stale dm"); err != nil {
+	if err := c.SendContactText(testPrefix, "stale dm", 1700000001); err != nil {
 		t.Fatalf("DM send must ignore the stale CLI reply: %v", err)
 	}
 	reply, err := c.RunCLI("send.heard 1700000000")
@@ -415,20 +415,24 @@ func TestRequestFiltersStaleFrames(t *testing.T) {
 	}
 }
 
-func TestSendTimestampsAreUnique(t *testing.T) {
-	h := startSession(t, startFakeRadio(t, nil, "> 2", false))
+func TestSendChannelTextUsesGivenTs(t *testing.T) {
+	sent := make(chan string, 4)
+	h := startSession(t, startFakeRadio(t, sent, "> 2", false))
 	c, info := h.client()
 
-	ts1, err := c.SendChannelText(info.DefaultIdx, "one")
-	if err != nil {
+	if err := c.SendChannelText(info.DefaultIdx, "one", 1700000042); err != nil {
 		t.Fatal(err)
 	}
-	ts2, err := c.SendContactText(testPrefix, "two")
-	if err != nil {
+	if err := c.SendChannelText(info.DefaultIdx, "one", 1700000042); err != nil {
 		t.Fatal(err)
 	}
-	if ts2 <= ts1 {
-		t.Fatalf("timestamps must be strictly increasing, got %d then %d", ts1, ts2)
+	// обе отправки ушли с одним ts — получатели схлопнут повтор дедупом
+	for i := 0; i < 2; i++ {
+		select {
+		case <-sent:
+		case <-time.After(2 * time.Second):
+			t.Fatal("fake radio did not see the sends")
+		}
 	}
 }
 
