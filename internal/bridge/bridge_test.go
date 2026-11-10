@@ -162,6 +162,10 @@ func newTestBridge(t *testing.T, tg *stubTG, r *stubRadio) *Bridge {
 		Contacts:   map[[6]byte]string{{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}: "Валера"},
 		DefaultIdx: 0,
 	}
+	if r != nil && r.chNames == nil {
+		// радио отдаёт те же каналы, что и снапшот сессии
+		r.chNames = map[byte]string{0: "Public", 1: "Other"}
+	}
 	return b
 }
 
@@ -582,5 +586,33 @@ func TestLinkTopicFallbackFromMessage(t *testing.T) {
 	ch, _ := b.r.(*stubRadio).texts()
 	if len(ch) != 1 || ch[0] != "сообщение" {
 		t.Fatalf("message must reach the new channel: %v", ch)
+	}
+}
+
+func TestLinkTopicFindsChannelCreatedAfterAttach(t *testing.T) {
+	r := &stubRadio{chNames: map[byte]string{0: "Public", 1: "Other"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+
+	// канал добавили после старта сессии — в снапшоте его нет
+	r.mu.Lock()
+	r.chNames[2] = "поздний"
+	r.mu.Unlock()
+
+	if !b.linkTopic(57, "поздний") {
+		t.Fatal("linkTopic failed")
+	}
+	if calls := r.setCalls; len(calls) != 0 {
+		t.Fatalf("existing radio channel must be reused, not recreated: %v", calls)
+	}
+	updates := []telegram.Update{
+		{UpdateID: 1, Message: &telegram.Message{MessageID: 11, Text: "туда",
+			MessageThreadID: 57, IsTopicMessage: true,
+			Chat: telegram.Chat{ID: -100500}, From: telegram.From{ID: 1, FirstName: "А"}}},
+	}
+	processUpdates(b, 0, updates)
+	ch, _ := r.texts()
+	if len(ch) != 1 || ch[0] != "туда" {
+		t.Fatalf("channel sends %v", ch)
 	}
 }

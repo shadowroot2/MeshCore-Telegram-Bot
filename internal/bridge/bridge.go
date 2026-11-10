@@ -268,17 +268,29 @@ func (b *Bridge) targetFromThread(m *telegram.Message) (target, bool) {
 func (b *Bridge) linkTopic(threadID int64, name string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.r == nil {
+		log.Printf("topics: radio offline, cannot link %q", name)
+		return false
+	}
 
+	// живой скан слотов: список с момента подключения мог устареть —
+	// канал мог добавить кто-то ещё (приложение, второй клиент)
 	idx := -1
-	for i, n := range b.info.Channels {
-		if strings.EqualFold(n, name) {
-			idx = int(i)
-			break
+	fresh := map[byte]string{}
+	for i := 0; i < maxChannelSlots; i++ {
+		n, err := b.r.QueryChannel(byte(i))
+		if err != nil || n == "" {
+			continue
+		}
+		fresh[byte(i)] = n
+		if strings.EqualFold(n, name) && idx < 0 {
+			idx = i
 		}
 	}
+	b.info.Channels = fresh
 	if idx < 0 {
 		for i := 0; i < maxChannelSlots; i++ {
-			if _, taken := b.info.Channels[byte(i)]; !taken {
+			if _, taken := fresh[byte(i)]; !taken {
 				idx = i
 				break
 			}
@@ -288,12 +300,8 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 		log.Printf("topics: no free channel slot for %q", name)
 		return false
 	}
-	if b.r == nil {
-		log.Printf("topics: radio offline, cannot link %q", name)
-		return false
-	}
 
-	if b.info.Channels[byte(idx)] == "" {
+	if fresh[byte(idx)] == "" {
 		var secret [16]byte
 		if _, err := rand.Read(secret[:]); err != nil {
 			log.Printf("topics: secret for %q: %v", name, err)
@@ -302,9 +310,6 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 		if err := b.r.SetChannel(byte(idx), name, secret); err != nil {
 			log.Printf("topics: create channel %q: %v", name, err)
 			return false
-		}
-		if b.info.Channels == nil {
-			b.info.Channels = map[byte]string{}
 		}
 		b.info.Channels[byte(idx)] = name
 		msg := fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\nКлюч: %x",
