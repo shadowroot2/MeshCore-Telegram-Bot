@@ -3,10 +3,9 @@ services:
     image: dmtrigub/meshcore-telegram-bot:latest
     container_name: meshcore-telegram-bot
     restart: unless-stopped
-    environment:
-      # чтобы пережить перезапуск контейнера и не плодить дубликаты вкладок
-      TOPICS_FILE: /app/data/topics.json
     volumes:
-      # .env и этот файл лежат в одной папке (на Synology: /volume1/docker/meshcore)
+      # Конфиг — единственный источник секретов; в образ он не попадает.
       - ./.env:/app/.env:ro
-      - ./data:/app/data
+      # Папка проекта целиком: data/ внутри неё создастся сама при первом
+      # старте (daemon Synology не создаёт отсутствующие bind-источники).
+      - .:/app/project
