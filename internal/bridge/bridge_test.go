@@ -635,57 +635,25 @@ func TestLinkTopicFindsChannelCreatedAfterAttach(t *testing.T) {
 	}
 }
 
-func TestLinkTopicPublicChannel(t *testing.T) {
+func TestLinkTopicEachChannelGetsOwnKey(t *testing.T) {
 	tg := &stubTG{}
 	b := newTestBridge(t, tg, &stubRadio{})
 
-	if !b.linkTopic(58, "#публичный") {
+	if !b.linkTopic(60, "#первый") {
 		t.Fatal("linkTopic failed")
 	}
-	if calls := b.r.(*stubRadio).setSecrets; len(calls) != 1 || calls[0] != meshcorePublicPSK {
-		t.Fatalf("#-channel must get the standard Public key: %x", calls)
-	}
-	sent, _, _ := tg.log()
-	if len(sent) != 1 || !strings.Contains(sent[0].text, "Публичный") {
-		t.Fatalf("public notice: %v", sent)
-	}
-	if strings.Contains(sent[0].text, "Ключ:") {
-		t.Fatalf("public channel must not dump a key: %q", sent[0].text)
-	}
-}
-
-func TestLinkTopicNormalizesWrongKey(t *testing.T) {
-	// #-канал на радио со случайным ключом (создан ботом раньше)
-	r := &stubRadio{chNames: map[byte]string{0: "Public", 1: "#старый"},
-		chSecrets: map[byte][16]byte{1: {0xAA, 0xBB}}}
-	tg := &stubTG{}
-	b := newTestBridge(t, tg, r)
-
-	if !b.linkTopic(59, "#старый") {
+	if !b.linkTopic(61, "#второй") {
 		t.Fatal("linkTopic failed")
 	}
-	if calls := r.setSecrets; len(calls) != 1 || calls[0] != meshcorePublicPSK {
-		t.Fatalf("wrong key must be rewritten to Public: %x", calls)
+	sec := b.r.(*stubRadio).setSecrets
+	if len(sec) != 2 || sec[0] == sec[1] {
+		t.Fatalf("channels must not share a key: %x", sec)
 	}
 	sent, _, _ := tg.log()
-	if len(sent) != 1 || !strings.Contains(sent[0].text, "приведён к стандартному") {
-		t.Fatalf("normalize notice: %v", sent)
-	}
-}
-
-func TestLinkTopicPrivateChannelGetsRandomKey(t *testing.T) {
-	tg := &stubTG{}
-	b := newTestBridge(t, tg, &stubRadio{})
-
-	if !b.linkTopic(60, "приватный") {
-		t.Fatal("linkTopic failed")
-	}
-	if calls := b.r.(*stubRadio).setSecrets; len(calls) != 1 || calls[0] == meshcorePublicPSK {
-		t.Fatalf("private channel must not use the Public key: %x", calls)
-	}
-	sent, _, _ := tg.log()
-	if len(sent) != 1 || !strings.Contains(sent[0].text, "Ключ:") {
-		t.Fatalf("private channel must publish its key: %v", sent)
+	for _, msg := range sent {
+		if !strings.Contains(msg.text, "Ключ:") {
+			t.Fatalf("each channel must publish its key: %q", msg.text)
+		}
 	}
 }
 
