@@ -17,7 +17,7 @@ func main() {
 	}
 
 	tg := telegram.New(cfg.BotToken, cfg.ChatID)
-	b := bridge.New(tg, cfg.TopicsFile)
+	b := bridge.New(tg, cfg.TopicsFile, cfg.TzOffset)
 	log.Printf("bridge: %s/%s <-> telegram %d (topics: %s)",
 		cfg.RadioAddr, cfg.ChannelName, cfg.ChatID, cfg.TopicsFile)
 

@@ -172,7 +172,7 @@ func (s *stubTG) log() ([]outMsg, []outReply, []string) {
 
 func newTestBridge(t *testing.T, tg *stubTG, r *stubRadio) *Bridge {
 	t.Helper()
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json"))
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
 	b.r = r
 	b.info = companion.SessionInfo{
 		Channels:   map[byte]string{0: "Public", 1: "Other"},
@@ -189,13 +189,13 @@ func newTestBridge(t *testing.T, tg *stubTG, r *stubRadio) *Bridge {
 func TestTopicsPersistAcrossReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "topics.json")
 	tg := &stubTG{}
-	t1 := New(tg, path)
+	t1 := New(tg, path, 5)
 	id := t1.topics.ensure("ch:0", "Public", tg)
 	if id == 0 {
 		t.Fatal("topic id must be minted")
 	}
 
-	t2 := New(tg, path)
+	t2 := New(tg, path, 5)
 	if got, ok := t2.topics.thread("ch:0"); !ok || got != id {
 		t.Fatalf("reloaded mapping wrong: %d %v", got, ok)
 	}
@@ -262,7 +262,7 @@ func TestDeliverResolvesUnknownChannel(t *testing.T) {
 
 func TestTopicsEnsureRetries(t *testing.T) {
 	tg := &stubTG{topicFailN: 1}
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json"))
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
 	id := b.topics.ensure("ch:0", "Public", tg)
 	if id == 0 {
 		t.Fatal("ensure must retry a failed creation")
@@ -336,7 +336,7 @@ func TestProcessUpdatesRoutesByTopic(t *testing.T) {
 
 func TestProcessUpdatesKeepsOffsetWhenRadioDown(t *testing.T) {
 	tg := &stubTG{}
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json")) // no session
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5) // no session
 
 	updates := []telegram.Update{
 		{UpdateID: 1, Message: &telegram.Message{MessageID: 11, Text: "привет",
@@ -779,27 +779,10 @@ func TestFormatForTelegramUsesRadioTZ(t *testing.T) {
 	}
 }
 
-func TestFetchTZFromRadio(t *testing.T) {
-	r := &stubRadio{reply: "> 5.5"}
-	tg := &stubTG{}
-	b := newTestBridge(t, tg, r)
-
-	b.fetchTZ()
+func TestLocationFromConfig(t *testing.T) {
+	b := New(&stubTG{}, filepath.Join(t.TempDir(), "topics.json"), 5.5)
 	_, off := time.Unix(0, 0).In(b.location()).Zone()
 	if off != 5*3600+30*60 {
 		t.Fatalf("offset = %d, want 5.5h", off)
-	}
-}
-
-func TestFetchTZOnceFromMemory(t *testing.T) {
-	r := &stubRadio{reply: "> 5"}
-	tg := &stubTG{}
-	b := newTestBridge(t, tg, r)
-
-	b.fetchTZ()
-	b.fetchTZ()
-	b.fetchTZ()
-	if r.cliCalls != 1 {
-		t.Fatalf("tz.offset queried %d times, want 1 (дальше из памяти)", r.cliCalls)
 	}
 }

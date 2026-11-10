@@ -16,6 +16,7 @@ type Config struct {
 	BotToken    string
 	ChatID      int64
 	TopicsFile  string
+	TzOffset    float64 // часы, для шапок времени в Telegram
 }
 
 // Load resolves settings with the precedence: defaults < config file <
@@ -26,6 +27,7 @@ func Load() (Config, error) {
 	c.RadioAddr = "127.0.0.1:5000"
 	c.ChannelName = "Public"
 	c.TopicsFile = "topics.json"
+	c.TzOffset = 5
 
 	path := os.Getenv("CONFIG_FILE")
 	explicit := path != ""
@@ -61,6 +63,13 @@ func Load() (Config, error) {
 	}
 	if v := get("TOPICS_FILE"); v != "" {
 		c.TopicsFile = v
+	}
+	if v := get("TZ_OFFSET"); v != "" {
+		hours, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return c, fmt.Errorf("TZ_OFFSET must be hours (например 5 или 5.5): %w", err)
+		}
+		c.TzOffset = hours
 	}
 	target := get("TARGET_CHAT_ID")
 	if target == "" {

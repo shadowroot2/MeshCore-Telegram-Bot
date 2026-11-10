@@ -159,12 +159,15 @@ type Bridge struct {
 	lastTs  uint32
 	retryTs map[int64][]uint32 // стабильные ts для повторных отправок
 
-	tzMu sync.Mutex
-	tz   *time.Location // пояс из tz.offset радио; nil = пояс машины
+	tz *time.Location // пояс из TZ_OFFSET конфига
 }
 
-func New(tg Telegram, topicsFile string) *Bridge {
-	return &Bridge{tg: tg, topics: loadTopics(topicsFile)}
+func New(tg Telegram, topicsFile string, tzHours float64) *Bridge {
+	loc := time.Local
+	if tzHours != 0 {
+		loc = time.FixedZone(fmt.Sprintf("UTC%+g", tzHours), int(tzHours*3600))
+	}
+	return &Bridge{tg: tg, topics: loadTopics(topicsFile), tz: loc}
 }
 
 // Attach implements companion.Hooks: remembers the session and syncs the
@@ -175,46 +178,11 @@ func (b *Bridge) Attach(c *companion.Client, info companion.SessionInfo) {
 	b.mu.Unlock()
 
 	b.syncTopics()
-	b.fetchTZ()
 }
 
-// fetchTZ забирает часовой пояс из настройки компаньена (get tz.offset) —
-// шапки сообщений должны совпадать с его экраном, а не с поясом машины.
-// Один раз за жизнь процесса: дальше значение живёт в памяти, реконнекты
-// радио не дёргают CLI. Новый tz.offset подхватится после перезапуска бота.
-func (b *Bridge) fetchTZ() {
-	b.tzMu.Lock()
-	have := b.tz != nil
-	b.tzMu.Unlock()
-	if have {
-		return
-	}
-	reply, err := b.r.RunCLI("get tz.offset")
-	if err != nil {
-		log.Printf("tz: %v (остаётся пояс машины)", err)
-		return
-	}
-	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(reply), ">"))
-	hours, err := strconv.ParseFloat(text, 64)
-	if err != nil {
-		log.Printf("tz: bad tz.offset reply %q", reply)
-		return
-	}
-	secs := int(hours * 3600)
-	b.tzMu.Lock()
-	b.tz = time.FixedZone(fmt.Sprintf("UTC%+g", hours), secs)
-	b.tzMu.Unlock()
-	log.Printf("tz: using radio tz.offset %+.2f", hours)
-}
-
-// location — пояс для шапок сообщений.
+// location — пояс для шапок сообщений (TZ_OFFSET из конфига).
 func (b *Bridge) location() *time.Location {
-	b.tzMu.Lock()
-	defer b.tzMu.Unlock()
-	if b.tz != nil {
-		return b.tz
-	}
-	return time.Local
+	return b.tz
 }
 
 // syncTopics: существующие вкладки привязываются по имени, недостающие —

@@ -34,6 +34,9 @@ func TestLoadDefaultsAndEnv(t *testing.T) {
 	if c.RadioAddr != "127.0.0.1:5000" || c.ChannelName != "Public" || c.TopicsFile != "topics.json" {
 		t.Fatalf("defaults wrong: %+v", c)
 	}
+	if c.TzOffset != 5 {
+		t.Fatalf("default TZ_OFFSET = %v, want +5", c.TzOffset)
+	}
 	if c.ChatID != -100500 || c.BotToken != "TOK" {
 		t.Fatalf("env wrong: %+v", c)
 	}
@@ -126,5 +129,22 @@ func TestLoadErrorListsFoundKeys(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("error must list keys, got %q", msg)
 		}
+	}
+}
+
+func TestLoadTzOffset(t *testing.T) {
+	writeConfig(t, "BOT_TOKEN=TOK\nTARGET_CHAT_ID=-100\nTZ_OFFSET=5.5\n")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TzOffset != 5.5 {
+		t.Fatalf("TZ_OFFSET = %v, want 5.5", c.TzOffset)
+	}
+
+	writeConfig(t, "BOT_TOKEN=TOK\nTARGET_CHAT_ID=-100\nTZ_OFFSET=abc\n")
+	if _, err := Load(); err == nil {
+		t.Fatal("bad TZ_OFFSET must fail")
 	}
 }
