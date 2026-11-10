@@ -180,7 +180,15 @@ func (b *Bridge) Attach(c *companion.Client, info companion.SessionInfo) {
 
 // fetchTZ забирает часовой пояс из настройки компаньена (get tz.offset) —
 // шапки сообщений должны совпадать с его экраном, а не с поясом машины.
+// Один раз за жизнь процесса: дальше значение живёт в памяти, реконнекты
+// радио не дёргают CLI. Новый tz.offset подхватится после перезапуска бота.
 func (b *Bridge) fetchTZ() {
+	b.tzMu.Lock()
+	have := b.tz != nil
+	b.tzMu.Unlock()
+	if have {
+		return
+	}
 	reply, err := b.r.RunCLI("get tz.offset")
 	if err != nil {
 		log.Printf("tz: %v (остаётся пояс машины)", err)

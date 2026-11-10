@@ -32,6 +32,7 @@ type stubRadio struct {
 	replyEr    error
 	sendErr    error
 	ts         uint32
+	cliCalls   int // сколько раз дёргали RunCLI
 }
 
 func (s *stubRadio) SendChannelText(idx byte, text string, ts uint32) error {
@@ -76,6 +77,7 @@ func (s *stubRadio) SetChannel(idx byte, name string, secret [16]byte) error {
 func (s *stubRadio) RunCLI(line string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.cliCalls++
 	return s.reply, s.replyEr
 }
 
@@ -786,5 +788,18 @@ func TestFetchTZFromRadio(t *testing.T) {
 	_, off := time.Unix(0, 0).In(b.location()).Zone()
 	if off != 5*3600+30*60 {
 		t.Fatalf("offset = %d, want 5.5h", off)
+	}
+}
+
+func TestFetchTZOnceFromMemory(t *testing.T) {
+	r := &stubRadio{reply: "> 5"}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+
+	b.fetchTZ()
+	b.fetchTZ()
+	b.fetchTZ()
+	if r.cliCalls != 1 {
+		t.Fatalf("tz.offset queried %d times, want 1 (дальше из памяти)", r.cliCalls)
 	}
 }
