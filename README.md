@@ -25,7 +25,7 @@ internal/telegram/           клиент Telegram Bot API
 internal/companion/          companion-протокол радио (TCP, бинарные фреймы)
 internal/bridge/             связка сторон: доставка, форматы, счётчик репиттеров
 docker/                      Dockerfile и docker-compose
-.github/workflows/ci.yml     CI: go vet/test + сборка образа
+.github/workflows/          CI (vet/test/build) и release (push на Docker Hub)
 ```
 
 ## Требования
@@ -98,6 +98,42 @@ make docker-up  # docker compose -f docker/docker-compose.yml up -d --build
 **`RADIO_ADDR` должен быть достижим из контейнера**: `127.0.0.1` внутри контейнера — это
 не хост, указывайте LAN-IP радио (или `host.docker.internal` для радио на хосте под
 macOS/Windows).
+
+## Synology (DS-425+ и другие с Container Manager)
+
+Образ лежит на Docker Hub как multi-arch (`linux/amd64` + `linux/arm64`) — DS-425+
+подходит без условностей, образ подтянется нужной архитектуры автоматически.
+
+### Через интерфейс DSM
+
+1. **Container Manager → Реестр** → `https://hub.docker.com` → найти
+   `dmtrigub/meshcore-telegram-bot` → «Скачать».
+2. **Образ → Запустить** → включить автозапуск; в «Переменные среды» указать
+   `BOT_TOKEN`, `TARGET_CHAT_ID`, `RADIO_ADDR` (LAN-IP радио!), `CHANNEL_NAME`.
+3. **Тома** — обязательно два смонтированных пути:
+   папку с `.env` (например `/docker/meshcore-telegram-bot`) и каталог данных
+   (напр. `/docker/meshcore-telegram-bot/data`) в `/app/data`, иначе после
+   перезапуска контейнера вкладки создадутся заново и старые осиротеют.
+
+### Через compose-проект
+
+```yaml
+services:
+  meshcore-telegram-bot:
+    image: dmtrigub/meshcore-telegram-bot:latest
+    container_name: meshcore-telegram-bot
+    restart: unless-stopped
+    environment:
+      TOPICS_FILE: /app/data/topics.json
+    volumes:
+      - /volume1/docker/meshcore-telegram-bot/.env:/app/.env:ro
+      - /volume1/docker/meshcore-telegram-bot/data:/app/data
+```
+
+Важно для NAS: `RADIO_ADDR` — адрес радио в LAN (`127.0.0.1` внутри контейнера — это не
+Synology); при включённом файрволе DSM разрешите исходящий трафик к радио и к
+`api.telegram.org`; образ работает от непривилегированного пользователя (uid 10001) —
+на смонтированную папку данных нужна запись.
 
 ## Формат сообщений
 

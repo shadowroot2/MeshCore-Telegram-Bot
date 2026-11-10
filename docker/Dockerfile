@@ -1,6 +1,9 @@
 # Сборка в отдельном контейнере, запуск — минимальный Alpine.
+# Multi-arch (linux/amd64, linux/arm64): Go-сборка идёт под архитектуру хоста
+# через кросс-компиляцию (TARGETARCH), поэтому QEMU-эмуляция не нужна.
 # Контекст сборки — корень репозитория (см. docker/docker-compose.yml).
-FROM golang:1.27-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
+ARG TARGETARCH
 WORKDIR /src
 
 COPY go.mod ./
@@ -8,7 +11,7 @@ RUN go mod download
 
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" \
 	-o /out/meshcore-telegram-bot ./cmd/meshcore-telegram-bot
 
 FROM alpine:3.20
