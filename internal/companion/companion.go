@@ -234,16 +234,18 @@ func (c *Client) SendContactText(prefix [contactPrefixLen]byte, text string) (ui
 	return ts, nil
 }
 
-// QueryChannel returns the name of a channel slot by index.
-func (c *Client) QueryChannel(idx byte) (string, error) {
+// QueryChannel returns the name and 16-byte secret of a channel slot.
+func (c *Client) QueryChannel(idx byte) (string, [16]byte, error) {
+	var secret [16]byte
 	f, err := c.request([]byte{cmdGetChannel, idx}, pktChannelInfo, pktError)
 	if err != nil {
-		return "", err
+		return "", secret, err
 	}
-	if f[0] != pktChannelInfo || len(f) < channelInfoName {
-		return "", radioErr("GET_CHANNEL", f)
+	if f[0] != pktChannelInfo || len(f) < channelInfoName+16 {
+		return "", secret, radioErr("GET_CHANNEL", f)
 	}
-	return trimNUL(f[2:channelInfoName]), nil
+	copy(secret[:], f[channelInfoName:channelInfoName+16])
+	return trimNUL(f[2:channelInfoName]), secret, nil
 }
 
 // SetChannel writes a group channel slot: name (31 bytes max) and the shared

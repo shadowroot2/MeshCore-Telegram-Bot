@@ -387,11 +387,11 @@ func TestQueryChannel(t *testing.T) {
 	h := startSession(t, startFakeRadio(t, nil, "> 2", false))
 	c, _ := h.client()
 
-	name, err := c.QueryChannel(1)
+	name, _, err := c.QueryChannel(1)
 	if err != nil || name != "Other" {
 		t.Fatalf("QueryChannel(1) = %q, %v", name, err)
 	}
-	if _, err := c.QueryChannel(5); err == nil {
+	if _, _, err := c.QueryChannel(5); err == nil {
 		t.Fatal("empty slot must fail")
 	}
 }

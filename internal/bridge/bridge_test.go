@@ -19,15 +19,17 @@ func msg(text string, ts uint32, snr float32, hasSNR bool) companion.Message {
 
 // stubRadio implements the radio interface without any network.
 type stubRadio struct {
-	mu       sync.Mutex
-	chSent   []string // тексты канальных отправок
-	dmSent   []string // тексты DM
-	chNames  map[byte]string
-	setCalls []string // имена, созданные через SetChannel
-	reply    string
-	replyEr  error
-	sendErr  error
-	ts       uint32
+	mu         sync.Mutex
+	chSent     []string // тексты канальных отправок
+	dmSent     []string // тексты DM
+	chNames    map[byte]string
+	chSecrets  map[byte][16]byte
+	setCalls   []string // имена, созданные через SetChannel
+	setSecrets [][16]byte
+	reply      string
+	replyEr    error
+	sendErr    error
+	ts         uint32
 }
 
 func (s *stubRadio) SendChannelText(idx byte, text string) (uint32, error) {
@@ -52,10 +54,10 @@ func (s *stubRadio) SendContactText(prefix [6]byte, text string) (uint32, error)
 	return s.ts, nil
 }
 
-func (s *stubRadio) QueryChannel(idx byte) (string, error) {
+func (s *stubRadio) QueryChannel(idx byte) (string, [16]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.chNames[idx], nil
+	return s.chNames[idx], s.chSecrets[idx], nil
 }
 
 func (s *stubRadio) SetChannel(idx byte, name string, secret [16]byte) error {
@@ -64,8 +66,13 @@ func (s *stubRadio) SetChannel(idx byte, name string, secret [16]byte) error {
 	if s.chNames == nil {
 		s.chNames = map[byte]string{}
 	}
+	if s.chSecrets == nil {
+		s.chSecrets = map[byte][16]byte{}
+	}
 	s.chNames[idx] = name
+	s.chSecrets[idx] = secret
 	s.setCalls = append(s.setCalls, name)
+	s.setSecrets = append(s.setSecrets, secret)
 	return nil
 }
 
@@ -614,5 +621,59 @@ func TestLinkTopicFindsChannelCreatedAfterAttach(t *testing.T) {
 	ch, _ := r.texts()
 	if len(ch) != 1 || ch[0] != "туда" {
 		t.Fatalf("channel sends %v", ch)
+	}
+}
+
+func TestLinkTopicPublicChannel(t *testing.T) {
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, &stubRadio{})
+
+	if !b.linkTopic(58, "#публичный") {
+		t.Fatal("linkTopic failed")
+	}
+	if calls := b.r.(*stubRadio).setSecrets; len(calls) != 1 || calls[0] != meshcorePublicPSK {
+		t.Fatalf("#-channel must get the standard Public key: %x", calls)
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "Публичный") {
+		t.Fatalf("public notice: %v", sent)
+	}
+	if strings.Contains(sent[0].text, "Ключ:") {
+		t.Fatalf("public channel must not dump a key: %q", sent[0].text)
+	}
+}
+
+func TestLinkTopicNormalizesWrongKey(t *testing.T) {
+	// #-канал на радио со случайным ключом (создан ботом раньше)
+	r := &stubRadio{chNames: map[byte]string{0: "Public", 1: "#старый"},
+		chSecrets: map[byte][16]byte{1: {0xAA, 0xBB}}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+
+	if !b.linkTopic(59, "#старый") {
+		t.Fatal("linkTopic failed")
+	}
+	if calls := r.setSecrets; len(calls) != 1 || calls[0] != meshcorePublicPSK {
+		t.Fatalf("wrong key must be rewritten to Public: %x", calls)
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "приведён к стандартному") {
+		t.Fatalf("normalize notice: %v", sent)
+	}
+}
+
+func TestLinkTopicPrivateChannelGetsRandomKey(t *testing.T) {
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, &stubRadio{})
+
+	if !b.linkTopic(60, "приватный") {
+		t.Fatal("linkTopic failed")
+	}
+	if calls := b.r.(*stubRadio).setSecrets; len(calls) != 1 || calls[0] == meshcorePublicPSK {
+		t.Fatalf("private channel must not use the Public key: %x", calls)
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "Ключ:") {
+		t.Fatalf("private channel must publish its key: %v", sent)
 	}
 }

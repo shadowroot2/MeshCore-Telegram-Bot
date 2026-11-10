@@ -32,7 +32,7 @@ const (
 type radio interface {
 	SendChannelText(idx byte, text string) (uint32, error)
 	SendContactText(prefix [6]byte, text string) (uint32, error)
-	QueryChannel(idx byte) (string, error)
+	QueryChannel(idx byte) (string, [16]byte, error)
 	SetChannel(idx byte, name string, secret [16]byte) error
 	RunCLI(line string) (string, error)
 }
@@ -161,6 +161,9 @@ func (b *Bridge) Attach(c *companion.Client, info companion.SessionInfo) {
 	b.mu.Unlock()
 
 	for idx, name := range info.Channels {
+		if _, secret, err := c.QueryChannel(idx); err == nil {
+			b.normalizePublicChannel(idx, name, secret)
+		}
 		b.topics.ensure(channelKey(idx), name, b.tg)
 		time.Sleep(250 * time.Millisecond) // Telegram rate-limits topic creation
 	}
@@ -208,7 +211,7 @@ func (b *Bridge) targetFor(m companion.Message) target {
 	name := b.info.Channels[m.ChannelIdx]
 	if name == "" && b.r != nil {
 		// канал мог появиться после старта сессии — спросим радио
-		if n, err := b.r.QueryChannel(m.ChannelIdx); err == nil && n != "" {
+		if n, _, err := b.r.QueryChannel(m.ChannelIdx); err == nil && n != "" {
 			name = n
 			b.info.Channels[m.ChannelIdx] = n
 		}
@@ -262,6 +265,51 @@ func (b *Bridge) targetFromThread(m *telegram.Message) (target, bool) {
 	return target{}, false
 }
 
+// meshcorePublicPSK — открытый ключ публичных каналов MeshCore (base64
+// "izOH6cXN6mrJ5e26oRXNcg==", как у канала Public в main_companion.cpp):
+// публичный канал с именем "#..." присоединяется по имени без обмена ключами.
+var meshcorePublicPSK = [16]byte{
+	0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
+	0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
+}
+
+// isPublicName: имя через "#" — публичный канал, без "#" — приватный
+// (как в приложении MeshCore: у публичных стоит #, у приватных — замок).
+func isPublicName(name string) bool {
+	return strings.HasPrefix(name, "#")
+}
+
+// channelSecret: публичному каналу — стандартный ключ Public, приватному —
+// случайный (его бот публикует в вкладке для передачи участникам).
+func channelSecret(name string) [16]byte {
+	if isPublicName(name) {
+		return meshcorePublicPSK
+	}
+	var s [16]byte
+	if _, err := rand.Read(s[:]); err != nil {
+		log.Printf("topics: secret for %q: %v", name, err)
+	}
+	return s
+}
+
+// normalizePublicChannel приводит ключ #-канала к стандартному Public,
+// если он был создан со случайным ключом.
+func (b *Bridge) normalizePublicChannel(idx byte, name string, secret [16]byte) {
+	if !isPublicName(name) || secret == meshcorePublicPSK {
+		return
+	}
+	if err := b.r.SetChannel(idx, name, meshcorePublicPSK); err != nil {
+		log.Printf("topics: normalize %q: %v", name, err)
+		return
+	}
+	log.Printf("topics: channel %q key set to the standard Public", name)
+	thread, _ := b.topics.thread(channelKey(idx))
+	if err := b.tg.SendMessage(fmt.Sprintf("🔑 ключ канала «%s» приведён к стандартному "+
+		"(публичный, добавляется по имени)", name), thread); err != nil {
+		log.Printf("telegram: %v", err)
+	}
+}
+
 // linkTopic binds a Telegram topic to a mesh channel: reuses a channel with
 // that name, or creates one on the radio (random secret, published in the
 // topic so it can be shared with the channel members).
@@ -278,13 +326,15 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 	idx := -1
 	fresh := map[byte]string{}
 	for i := 0; i < maxChannelSlots; i++ {
-		n, err := b.r.QueryChannel(byte(i))
+		n, secret, err := b.r.QueryChannel(byte(i))
 		if err != nil || n == "" {
 			continue
 		}
 		fresh[byte(i)] = n
 		if strings.EqualFold(n, name) && idx < 0 {
 			idx = i
+			// #-канал обязан быть публичным: приводим ключ к стандартному
+			b.normalizePublicChannel(byte(i), n, secret)
 		}
 	}
 	b.info.Channels = fresh
@@ -302,18 +352,20 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 	}
 
 	if fresh[byte(idx)] == "" {
-		var secret [16]byte
-		if _, err := rand.Read(secret[:]); err != nil {
-			log.Printf("topics: secret for %q: %v", name, err)
-			return false
-		}
+		secret := channelSecret(name)
 		if err := b.r.SetChannel(byte(idx), name, secret); err != nil {
 			log.Printf("topics: create channel %q: %v", name, err)
 			return false
 		}
 		b.info.Channels[byte(idx)] = name
-		msg := fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\nКлюч: %x",
-			name, idx, secret)
+		var msg string
+		if isPublicName(name) {
+			msg = fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\n"+
+				"Публичный: добавляется по имени, ключ — стандартный Public", name, idx)
+		} else {
+			msg = fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\nКлюч: %x",
+				name, idx, secret)
+		}
 		if err := b.tg.SendMessage(msg, threadID); err != nil {
 			log.Printf("telegram: %v", err)
 		}
