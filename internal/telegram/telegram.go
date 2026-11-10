@@ -34,13 +34,19 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID       int64    `json:"message_id"`
-	MessageThreadID int64    `json:"message_thread_id"`
-	IsTopicMessage  bool     `json:"is_topic_message"`
-	Text            string   `json:"text"`
-	Chat            Chat     `json:"chat"`
-	From            From     `json:"from"`
-	ReplyToMessage  *Message `json:"reply_to_message"`
+	MessageID         int64            `json:"message_id"`
+	MessageThreadID   int64            `json:"message_thread_id"`
+	IsTopicMessage    bool             `json:"is_topic_message"`
+	Text              string           `json:"text"`
+	Chat              Chat             `json:"chat"`
+	From              From             `json:"from"`
+	ReplyToMessage    *Message         `json:"reply_to_message"`
+	ForumTopicCreated *ForumTopicEvent `json:"forum_topic_created"`
+}
+
+// ForumTopicEvent is the payload of topic service messages.
+type ForumTopicEvent struct {
+	Name string `json:"name"`
 }
 
 type Chat struct {
@@ -93,6 +99,21 @@ func (c *Client) CreateForumTopic(name string) (int64, error) {
 		return 0, err
 	}
 	return res.MessageThreadID, nil
+}
+
+// GetForumTopic returns the name of a вкладка by id.
+func (c *Client) GetForumTopic(threadID int64) (string, error) {
+	var res struct {
+		Name string `json:"name"`
+	}
+	err := c.call("getForumTopic", url.Values{
+		"chat_id":           {strconv.FormatInt(c.chatID, 10)},
+		"message_thread_id": {strconv.FormatInt(threadID, 10)},
+	}, &res)
+	if err != nil {
+		return "", err
+	}
+	return res.Name, nil
 }
 
 // postRetryDelay is a var so tests can shorten it.

@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,13 +23,17 @@ import (
 // tests can shorten it.
 var heardCheckDelay = 5 * time.Second
 
-const maxNameLen = 32 // sender name budget before it eats the mesh text
+const (
+	maxNameLen      = 32 // sender name budget before it eats the mesh text
+	maxChannelSlots = 8  // group channel slots on the radio
+)
 
 // radio is the mesh side the bridge needs; *companion.Client implements it.
 type radio interface {
 	SendChannelText(idx byte, text string) (uint32, error)
 	SendContactText(prefix [6]byte, text string) (uint32, error)
 	QueryChannel(idx byte) (string, error)
+	SetChannel(idx byte, name string, secret [16]byte) error
 	RunCLI(line string) (string, error)
 }
 
@@ -40,6 +45,7 @@ type Telegram interface {
 	SendMessage(text string, threadID int64) error
 	ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	CreateForumTopic(name string) (int64, error)
+	GetForumTopic(threadID int64) (string, error)
 }
 
 // target is one mesh endpoint and its Telegram topic.
@@ -254,6 +260,76 @@ func (b *Bridge) targetFromThread(m *telegram.Message) (target, bool) {
 	return target{}, false
 }
 
+// linkTopic binds a Telegram topic to a mesh channel: reuses a channel with
+// that name, or creates one on the radio (random secret, published in the
+// topic so it can be shared with the channel members).
+func (b *Bridge) linkTopic(threadID int64, name string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	idx := -1
+	for i, n := range b.info.Channels {
+		if strings.EqualFold(n, name) {
+			idx = int(i)
+			break
+		}
+	}
+	if idx < 0 {
+		for i := 0; i < maxChannelSlots; i++ {
+			if _, taken := b.info.Channels[byte(i)]; !taken {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		log.Printf("topics: no free channel slot for %q", name)
+		return false
+	}
+	if b.r == nil {
+		log.Printf("topics: radio offline, cannot link %q", name)
+		return false
+	}
+
+	if b.info.Channels[byte(idx)] == "" {
+		var secret [16]byte
+		if _, err := rand.Read(secret[:]); err != nil {
+			log.Printf("topics: secret for %q: %v", name, err)
+			return false
+		}
+		if err := b.r.SetChannel(byte(idx), name, secret); err != nil {
+			log.Printf("topics: create channel %q: %v", name, err)
+			return false
+		}
+		if b.info.Channels == nil {
+			b.info.Channels = map[byte]string{}
+		}
+		b.info.Channels[byte(idx)] = name
+		msg := fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\nКлюч: %x",
+			name, idx, secret)
+		if err := b.tg.SendMessage(msg, threadID); err != nil {
+			log.Printf("telegram: %v", err)
+		}
+		log.Printf("topics: channel %q -> idx %d created", name, idx)
+	}
+
+	b.topics.bind(channelKey(byte(idx)), threadID)
+	return true
+}
+
+// linkTopicFromTG resolves an unknown topic's name over the API and links it.
+func (b *Bridge) linkTopicFromTG(threadID int64) bool {
+	if threadID <= 0 {
+		return false
+	}
+	name, err := b.tg.GetForumTopic(threadID)
+	if err != nil || name == "" {
+		log.Printf("topics: get topic %d: %v", threadID, err)
+		return false
+	}
+	return b.linkTopic(threadID, name)
+}
+
 func (b *Bridge) sendTo(t target, text string) (uint32, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -320,11 +396,30 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 			offset = u.UpdateID + 1
 			continue
 		}
-		tgt, ok := b.targetFromThread(m)
-		if !ok {
-			log.Printf("mesh: unknown topic (thread %d), skipping", m.MessageThreadID)
+		// тема создана вручную → создать/привязать mesh-канал
+		if m.ForumTopicCreated != nil {
+			b.linkTopic(m.MessageThreadID, m.ForumTopicCreated.Name)
 			offset = u.UpdateID + 1
 			continue
+		}
+		body := strings.TrimSpace(m.Text)
+		if body == "" {
+			offset = u.UpdateID + 1
+			continue
+		}
+		tgt, ok := b.targetFromThread(m)
+		if !ok {
+			// тема без привязки (создана раньше бота) — создать канал по её имени
+			if !b.linkTopicFromTG(m.MessageThreadID) {
+				log.Printf("mesh: unknown topic (thread %d), skipping", m.MessageThreadID)
+				offset = u.UpdateID + 1
+				continue
+			}
+			tgt, ok = b.targetFromThread(m)
+			if !ok {
+				offset = u.UpdateID + 1
+				continue
+			}
 		}
 		budget := companion.MaxDMText
 		if tgt.kind == companion.KindChannel {

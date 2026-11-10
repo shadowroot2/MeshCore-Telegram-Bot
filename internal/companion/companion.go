@@ -22,6 +22,7 @@ const (
 	cmdGetContacts       = 0x04
 	cmdSyncNextMessage   = 0x0A
 	cmdGetChannel        = 0x1F
+	cmdSetChannel        = 0x20
 	cmdRunCLICommand     = 0x42
 
 	pktOK           = 0x00
@@ -243,6 +244,24 @@ func (c *Client) QueryChannel(idx byte) (string, error) {
 		return "", radioErr("GET_CHANNEL", f)
 	}
 	return trimNUL(f[2:channelInfoName]), nil
+}
+
+// SetChannel writes a group channel slot: name (31 bytes max) and the shared
+// 16-byte secret every member of the channel must have.
+func (c *Client) SetChannel(idx byte, name string, secret [16]byte) error {
+	payload := make([]byte, 50) // 1 + 1 + 32 + 16
+	payload[0] = cmdSetChannel
+	payload[1] = idx
+	copy(payload[2:34], Truncate(name, 31))
+	copy(payload[34:50], secret[:])
+	f, err := c.request(payload, pktOK, pktError)
+	if err != nil {
+		return err
+	}
+	if f[0] != pktOK {
+		return radioErr("SET_CHANNEL", f)
+	}
+	return nil
 }
 
 // RunCLI runs a text CLI line on the radio and returns its reply text.

@@ -19,14 +19,15 @@ func msg(text string, ts uint32, snr float32, hasSNR bool) companion.Message {
 
 // stubRadio implements the radio interface without any network.
 type stubRadio struct {
-	mu      sync.Mutex
-	chSent  []string // тексты канальных отправок
-	dmSent  []string // тексты DM
-	chNames map[byte]string
-	reply   string
-	replyEr error
-	sendErr error
-	ts      uint32
+	mu       sync.Mutex
+	chSent   []string // тексты канальных отправок
+	dmSent   []string // тексты DM
+	chNames  map[byte]string
+	setCalls []string // имена, созданные через SetChannel
+	reply    string
+	replyEr  error
+	sendErr  error
+	ts       uint32
 }
 
 func (s *stubRadio) SendChannelText(idx byte, text string) (uint32, error) {
@@ -57,6 +58,17 @@ func (s *stubRadio) QueryChannel(idx byte) (string, error) {
 	return s.chNames[idx], nil
 }
 
+func (s *stubRadio) SetChannel(idx byte, name string, secret [16]byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.chNames == nil {
+		s.chNames = map[byte]string{}
+	}
+	s.chNames[idx] = name
+	s.setCalls = append(s.setCalls, name)
+	return nil
+}
+
 func (s *stubRadio) RunCLI(line string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -83,12 +95,13 @@ type outReply struct {
 // stubTG implements the Telegram interface, recording outgoing traffic and
 // minting topic ids on createForumTopic.
 type stubTG struct {
-	mu         sync.Mutex
-	sent       []outMsg
-	replies    []outReply
-	created    []string
-	nextID     int64
-	topicFailN int // fail this many CreateForumTopic calls first
+	mu          sync.Mutex
+	sent        []outMsg
+	replies     []outReply
+	created     []string
+	nextID      int64
+	topicFailN  int // fail this many CreateForumTopic calls first
+	threadNames map[int64]string
 }
 
 func (s *stubTG) ChatID() int64 { return -100500 }
@@ -107,6 +120,16 @@ func (s *stubTG) ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	defer s.mu.Unlock()
 	s.replies = append(s.replies, outReply{threadID, replyToMsgID, text})
 	return nil
+}
+
+func (s *stubTG) GetForumTopic(threadID int64) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name, ok := s.threadNames[threadID]
+	if !ok {
+		return "", errors.New("topic not found")
+	}
+	return name, nil
 }
 
 func (s *stubTG) CreateForumTopic(name string) (int64, error) {
@@ -484,5 +507,80 @@ func TestMeshMessagesSplitsLong(t *testing.T) {
 	}
 	if strings.Join(strings.Fields(joined), " ") != strings.Join(strings.Fields(body), " ") {
 		t.Fatal("chunks must preserve the full body")
+	}
+}
+
+func TestLinkTopicCreatesChannel(t *testing.T) {
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, &stubRadio{})
+
+	// событие создания темы вручную
+	if !b.linkTopic(55, "новый-канал") {
+		t.Fatal("linkTopic failed")
+	}
+
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || sent[0].thread != 55 {
+		t.Fatalf("key message must land in the topic: %v", sent)
+	}
+	if !strings.Contains(sent[0].text, "новый-канал") || !strings.Contains(sent[0].text, "Ключ:") {
+		t.Fatalf("key message: %q", sent[0].text)
+	}
+
+	// сообщения из этой темы теперь идут в новый канал
+	updates := []telegram.Update{
+		{UpdateID: 1, Message: &telegram.Message{MessageID: 11, Text: "привет",
+			MessageThreadID: 55, IsTopicMessage: true,
+			Chat: telegram.Chat{ID: -100500}, From: telegram.From{ID: 1, FirstName: "А"}}},
+	}
+	if next := processUpdates(b, 0, updates); next != 2 {
+		t.Fatalf("offset = %d", next)
+	}
+	ch, _ := b.r.(*stubRadio).texts()
+	if len(ch) != 1 || ch[0] != "привет" {
+		t.Fatalf("channel sends %v", ch)
+	}
+}
+
+func TestLinkTopicReusesChannel(t *testing.T) {
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, &stubRadio{})
+
+	if !b.linkTopic(56, "Other") {
+		t.Fatal("linkTopic failed")
+	}
+	if calls := b.r.(*stubRadio).setCalls; len(calls) != 0 {
+		t.Fatalf("existing channel must not be recreated: %v", calls)
+	}
+	updates := []telegram.Update{
+		{UpdateID: 1, Message: &telegram.Message{MessageID: 11, Text: "туда",
+			MessageThreadID: 56, IsTopicMessage: true,
+			Chat: telegram.Chat{ID: -100500}, From: telegram.From{ID: 1, FirstName: "А"}}},
+	}
+	processUpdates(b, 0, updates)
+	ch, _ := b.r.(*stubRadio).texts()
+	if len(ch) != 1 || ch[0] != "туда" {
+		t.Fatalf("channel sends %v", ch)
+	}
+}
+
+func TestLinkTopicFallbackFromMessage(t *testing.T) {
+	tg := &stubTG{threadNames: map[int64]string{70: "забытая"}}
+	b := newTestBridge(t, tg, &stubRadio{})
+
+	updates := []telegram.Update{
+		{UpdateID: 1, Message: &telegram.Message{MessageID: 11, Text: "сообщение",
+			MessageThreadID: 70, IsTopicMessage: true,
+			Chat: telegram.Chat{ID: -100500}, From: telegram.From{ID: 1, FirstName: "А"}}},
+	}
+	if next := processUpdates(b, 0, updates); next != 2 {
+		t.Fatalf("offset = %d", next)
+	}
+	if calls := b.r.(*stubRadio).setCalls; len(calls) != 1 || calls[0] != "забытая" {
+		t.Fatalf("channel must be created from topic name: %v", calls)
+	}
+	ch, _ := b.r.(*stubRadio).texts()
+	if len(ch) != 1 || ch[0] != "сообщение" {
+		t.Fatalf("message must reach the new channel: %v", ch)
 	}
 }
