@@ -380,31 +380,31 @@ func TestHeardCountGarbageReply(t *testing.T) {
 func TestFormatForTelegram(t *testing.T) {
 	m := msg("привет из меша", 1700000000, 8.5, true)
 	want := time.Unix(1700000000, 0).Format("15:04") + " · SNR 8.5 dB\nпривет из меша"
-	if got := formatForTelegram(m, ""); got != want {
+	if got := formatForTelegram(m, "", time.Local); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 
 	// wire-префикс "Имя: " превращается в "[Имя]"
 	m2 := msg("ShadoW: И тебе привет", 0, 0, false)
-	if got := formatForTelegram(m2, ""); got != "[ShadoW] И тебе привет" {
+	if got := formatForTelegram(m2, "", time.Local); got != "[ShadoW] И тебе привет" {
 		t.Fatalf("got %q", got)
 	}
 
 	// DM: имя контакта подставляется, т.к. в тексте его нет
 	m3 := msg("личка", 1700000000, 0, false)
 	want3 := time.Unix(1700000000, 0).Format("15:04") + "\n[Валера] личка"
-	if got := formatForTelegram(m3, "Валера"); got != want3 {
+	if got := formatForTelegram(m3, "Валера", time.Local); got != want3 {
 		t.Fatalf("got %q, want %q", got, want3)
 	}
 
 	m4 := msg("без часов", 0, 8.5, true)
-	if got := formatForTelegram(m4, ""); got != "SNR 8.5 dB\nбез часов" {
+	if got := formatForTelegram(m4, "", time.Local); got != "SNR 8.5 dB\nбез часов" {
 		t.Fatalf("got %q", got)
 	}
 
 	// маркеры зеркал (джойстик/автоматика) вычищаются
 	m5 := msg("(>>✓) ShadoW: test", 0, 0, false)
-	if got := formatForTelegram(m5, ""); got != "[ShadoW] test" {
+	if got := formatForTelegram(m5, "", time.Local); got != "[ShadoW] test" {
 		t.Fatalf("mirror marker: %q", got)
 	}
 }
@@ -763,5 +763,28 @@ func TestRetryReusesTimestamp(t *testing.T) {
 	}
 	if ts[0] != ts[1] {
 		t.Fatalf("retry must reuse the timestamp: %d vs %d", ts[0], ts[1])
+	}
+}
+
+func TestFormatForTelegramUsesRadioTZ(t *testing.T) {
+	// 1700000000 = 2023-11-14 22:13:20 UTC; на UTC+5 это 03:13
+	loc := time.FixedZone("UTC+5", 5*3600)
+	want := "03:13\n[Имя] Да"
+	got := formatForTelegram(companion.Message{Kind: companion.KindDM,
+		Text: "Да", Time: 1700000000}, "Имя", loc)
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestFetchTZFromRadio(t *testing.T) {
+	r := &stubRadio{reply: "> 5.5"}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+
+	b.fetchTZ()
+	_, off := time.Unix(0, 0).In(b.location()).Zone()
+	if off != 5*3600+30*60 {
+		t.Fatalf("offset = %d, want 5.5h", off)
 	}
 }

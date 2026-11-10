@@ -158,6 +158,9 @@ type Bridge struct {
 	tsMu    sync.Mutex
 	lastTs  uint32
 	retryTs map[int64][]uint32 // стабильные ts для повторных отправок
+
+	tzMu sync.Mutex
+	tz   *time.Location // пояс из tz.offset радио; nil = пояс машины
 }
 
 func New(tg Telegram, topicsFile string) *Bridge {
@@ -172,6 +175,38 @@ func (b *Bridge) Attach(c *companion.Client, info companion.SessionInfo) {
 	b.mu.Unlock()
 
 	b.syncTopics()
+	b.fetchTZ()
+}
+
+// fetchTZ забирает часовой пояс из настройки компаньена (get tz.offset) —
+// шапки сообщений должны совпадать с его экраном, а не с поясом машины.
+func (b *Bridge) fetchTZ() {
+	reply, err := b.r.RunCLI("get tz.offset")
+	if err != nil {
+		log.Printf("tz: %v (остаётся пояс машины)", err)
+		return
+	}
+	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(reply), ">"))
+	hours, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		log.Printf("tz: bad tz.offset reply %q", reply)
+		return
+	}
+	secs := int(hours * 3600)
+	b.tzMu.Lock()
+	b.tz = time.FixedZone(fmt.Sprintf("UTC%+g", hours), secs)
+	b.tzMu.Unlock()
+	log.Printf("tz: using radio tz.offset %+.2f", hours)
+}
+
+// location — пояс для шапок сообщений.
+func (b *Bridge) location() *time.Location {
+	b.tzMu.Lock()
+	defer b.tzMu.Unlock()
+	if b.tz != nil {
+		return b.tz
+	}
+	return time.Local
 }
 
 // syncTopics: существующие вкладки привязываются по имени, недостающие —
@@ -243,7 +278,7 @@ func (b *Bridge) Deliver(m companion.Message) error {
 	if m.Kind == companion.KindDM {
 		dmName = t.name
 	}
-	return b.tg.SendMessage(formatForTelegram(m, dmName), thread)
+	return b.tg.SendMessage(formatForTelegram(m, dmName, b.location()), thread)
 }
 
 func (b *Bridge) targetFor(m companion.Message) target {
@@ -648,7 +683,7 @@ func quotedContact(text string) string {
 // on its own line above "[Имя] текст". A zero mesh timestamp (no clock on
 // the sending node) is left out rather than shown as epoch. dmName names the
 // contact for DMs, whose wire text carries no sender prefix.
-func formatForTelegram(m companion.Message, dmName string) string {
+func formatForTelegram(m companion.Message, dmName string, loc *time.Location) string {
 	// служебные маркеры зеркал (джойстик/автоматика) в TG не показываем
 	text := strings.TrimPrefix(m.Text, "(>>\u2713) ")
 	text = strings.TrimPrefix(text, "(>>\u2717) ")
@@ -663,7 +698,7 @@ func formatForTelegram(m companion.Message, dmName string) string {
 
 	head := ""
 	if m.Time > 0 {
-		head = time.Unix(int64(m.Time), 0).Format("15:04")
+		head = time.Unix(int64(m.Time), 0).In(loc).Format("15:04")
 	}
 	if m.HasSNR {
 		if head != "" {
