@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -98,5 +99,32 @@ func TestLoadBadLine(t *testing.T) {
 	writeConfig(t, "GARBAGE WITHOUT EQUALS\n")
 	if _, err := Load(); err == nil {
 		t.Fatal("malformed line must fail")
+	}
+}
+
+func TestLoadStripsQuotes(t *testing.T) {
+	writeConfig(t, "BOT_TOKEN=\"TOK\"\nTARGET_CHAT_ID='-100777'\n")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.BotToken != "TOK" || c.ChatID != -100777 {
+		t.Fatalf("quotes not stripped: %+v", c)
+	}
+}
+
+func TestLoadErrorListsFoundKeys(t *testing.T) {
+	writeConfig(t, "BOT_TOKEN=TOK\nRADIO_ADDR=10.0.0.5:5000\n")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("missing TARGET_CHAT_ID must fail")
+	}
+	msg := err.Error()
+	for _, want := range []string{"TARGET_CHAT_ID", "BOT_TOKEN", "RADIO_ADDR"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error must list keys, got %q", msg)
+		}
 	}
 }

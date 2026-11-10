@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -32,11 +33,13 @@ func Load() (Config, error) {
 		path = ".env"
 	}
 	vals, err := readConfigFile(path)
+	src := path
 	if err != nil {
 		if explicit || !errors.Is(err, os.ErrNotExist) {
 			return c, err
 		}
 		vals = map[string]string{}
+		src = path + " (file not found)"
 	}
 
 	get := func(key string) string {
@@ -48,7 +51,7 @@ func Load() (Config, error) {
 
 	c.BotToken = get("BOT_TOKEN")
 	if c.BotToken == "" {
-		return c, errors.New("BOT_TOKEN is empty (.env or environment)")
+		return c, emptyErr(src, vals, "BOT_TOKEN")
 	}
 	if v := get("RADIO_ADDR"); v != "" {
 		c.RadioAddr = v
@@ -61,7 +64,7 @@ func Load() (Config, error) {
 	}
 	target := get("TARGET_CHAT_ID")
 	if target == "" {
-		return c, errors.New("TARGET_CHAT_ID is empty (.env or environment)")
+		return c, emptyErr(src, vals, "TARGET_CHAT_ID")
 	}
 	chatID, err := strconv.ParseInt(target, 10, 64)
 	if err != nil {
@@ -71,8 +74,24 @@ func Load() (Config, error) {
 	return c, nil
 }
 
+// emptyErr names the missing key and lists the keys the file did contain —
+// enough to diagnose a misconfigured container from its logs alone.
+func emptyErr(src string, vals map[string]string, key string) error {
+	names := make([]string, 0, len(vals))
+	for k := range vals {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	have := strings.Join(names, ", ")
+	if have == "" {
+		have = "none"
+	}
+	return fmt.Errorf("%s is empty (checked %s and environment); keys found: %s", key, src, have)
+}
+
 // readConfigFile parses a KEY=VALUE file: blank lines and `#` comments are
-// ignored, the value is everything after the first `=`.
+// ignored, the value is everything after the first `=` (optional surrounding
+// quotes are stripped).
 func readConfigFile(path string) (map[string]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -91,10 +110,19 @@ func readConfigFile(path string) (map[string]string, error) {
 		if !ok {
 			return nil, fmt.Errorf("%s: not KEY=VALUE: %q", path, line)
 		}
-		vals[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		vals[strings.TrimSpace(k)] = unquote(strings.TrimSpace(v))
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return vals, nil
+}
+
+func unquote(v string) string {
+	if n := len(v); n >= 2 {
+		if (v[0] == '"' && v[n-1] == '"') || (v[0] == '\'' && v[n-1] == '\'') {
+			return v[1 : n-1]
+		}
+	}
+	return v
 }
