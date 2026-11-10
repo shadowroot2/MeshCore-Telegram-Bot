@@ -123,6 +123,37 @@ func (t *topics) key(thread int64) (string, bool) {
 	return k, ok
 }
 
+// isNotFound — Telegram отвечает так на обращение к удалённой вкладке.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "not_found")
+}
+
+// invalidate выбрасывает маппинг удалённой вкладки.
+func (t *topics) invalidate(key string) {
+	t.mu.Lock()
+	if e, ok := t.byKey[key]; ok {
+		delete(t.byID, e.ID)
+		delete(t.byKey, key)
+	}
+	raw := make(map[string]topicEntry, len(t.byKey))
+	for k, e := range t.byKey {
+		raw[k] = e
+	}
+	t.mu.Unlock()
+
+	data, err := json.Marshal(raw)
+	if err == nil {
+		err = os.WriteFile(t.path, data, 0o600)
+	}
+	if err != nil {
+		log.Printf("topics: save %s: %v", t.path, err)
+	}
+}
+
 func (t *topics) bind(key string, thread int64, name string) {
 	t.mu.Lock()
 	t.byKey[key] = topicEntry{ID: thread, Name: name}
@@ -151,16 +182,22 @@ func (t *topics) ensure(key, name string, tg Telegram) int64 {
 	t.mu.Lock()
 	e, ok := t.byKey[key]
 	t.mu.Unlock()
-	if ok {
-		if e.Name != name {
-			if err := tg.EditForumTopic(e.ID, name); err != nil {
-				log.Printf("topics: rename %q -> %q: %v", e.Name, name, err)
-			} else {
-				log.Printf("topics: %q renamed to %q", e.Name, name)
-				t.bind(key, e.ID, name)
-			}
-		}
+	if ok && e.Name == name {
 		return e.ID
+	}
+	if ok {
+		err := tg.EditForumTopic(e.ID, name)
+		if err == nil {
+			log.Printf("topics: %q renamed to %q", e.Name, name)
+			t.bind(key, e.ID, name)
+			return e.ID
+		}
+		if !isNotFound(err) {
+			log.Printf("topics: rename %q -> %q: %v", e.Name, name, err)
+			return e.ID
+		}
+		log.Printf("topics: %q was deleted in Telegram, creating anew", e.Name)
+		t.invalidate(key)
 	}
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -286,7 +323,16 @@ func (b *Bridge) Deliver(m companion.Message) error {
 	if m.Kind == companion.KindDM {
 		dmName = t.name
 	}
-	return b.tg.SendMessage(formatForTelegram(m, dmName, b.location()), thread)
+	text := formatForTelegram(m, dmName, b.location())
+	err := b.tg.SendMessage(text, thread)
+	if !isNotFound(err) {
+		return err
+	}
+	// вкладку удалили в Telegram — маппинг протух, создаём заново
+	log.Printf("topics: %q was deleted in Telegram, recreating", t.name)
+	b.topics.invalidate(t.key)
+	thread = b.topics.ensure(t.key, t.name, b.tg)
+	return b.tg.SendMessage(text, thread)
 }
 
 // contactName возвращает имя контакта; для неизвестного/безымянного префикса

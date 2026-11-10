@@ -123,6 +123,8 @@ type stubTG struct {
 	threadNames map[int64]string
 	renames     []string
 	listed      map[string]int64 // имя вкладки -> thread id для ListForumTopics
+	sendFailN   int              // столько SendMessage подряд упадут с "not found"
+	editErr     error
 }
 
 func (s *stubTG) ChatID() int64 { return -100500 }
@@ -132,6 +134,10 @@ func (s *stubTG) GetUpdates(offset int64) ([]telegram.Update, error) { return ni
 func (s *stubTG) SendMessage(text string, threadID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.sendFailN > 0 {
+		s.sendFailN--
+		return errors.New("Bad Request: message thread not found")
+	}
 	s.sent = append(s.sent, outMsg{text, threadID})
 	return nil
 }
@@ -156,6 +162,9 @@ func (s *stubTG) ListForumTopics(maxThreadID, maxMisses int64) map[string]int64 
 func (s *stubTG) EditForumTopic(threadID int64, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.editErr != nil {
+		return s.editErr
+	}
 	s.renames = append(s.renames, name)
 	return nil
 }
@@ -857,5 +866,47 @@ func TestDMTopicRenamedWhenNameKnown(t *testing.T) {
 	}
 	if len(sent) != 1 || !strings.Contains(sent[0].text, "[Валера]") {
 		t.Fatalf("message must use the contact name: %v", sent)
+	}
+}
+
+func TestDeliverRecreatesDeletedTopic(t *testing.T) {
+	prefix := [6]byte{0x02, 0x62, 0xAA, 0xBB, 0xCC, 0xDD}
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{sendFailN: 1}
+	b := newTestBridge(t, tg, r)
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	// маппинг на вкладку, которую удалили в Telegram
+	b.topics.bind(dmKey(prefix), 55, "Валера")
+
+	dm := companion.Message{Kind: companion.KindDM, Prefix: prefix,
+		Text: "снова", Time: 3}
+	if err := b.Deliver(dm); err != nil {
+		t.Fatalf("deleted topic must be recreated and resent: %v", err)
+	}
+
+	sent, _, created := tg.log()
+	if len(created) != 1 || created[0] != "Валера" {
+		t.Fatalf("topic must be recreated: %v", created)
+	}
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "снова") {
+		t.Fatalf("message must be resent to the new topic: %v", sent)
+	}
+}
+
+func TestEnsureRecreatesWhenRenameFindsDeleted(t *testing.T) {
+	tg := &stubTG{editErr: errors.New("Bad Request: message thread not found")}
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
+	b.topics.bind("dm:aabbccdd", 55, "dm-aabb")
+
+	id := b.topics.ensure("dm:aabbccdd", "Валера", tg)
+	if id == 0 {
+		t.Fatal("deleted topic must be recreated")
+	}
+	if id == 55 {
+		t.Fatal("must not reuse the dead thread id")
+	}
+	_, _, created := tg.log()
+	if len(created) != 1 || created[0] != "Валера" {
+		t.Fatalf("recreated with the contact name: %v", created)
 	}
 }
