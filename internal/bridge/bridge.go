@@ -668,7 +668,8 @@ func meshMessages(m *telegram.Message, budget int) []string {
 	mention := ""
 	if m.ReplyToMessage != nil {
 		if who := quotedContact(m.ReplyToMessage.Text); who != "" {
-			mention = "@" + who + " "
+			// формат упоминания как в приложении MeshCore: @[Имя]
+			mention = "@[" + who + "] "
 		}
 	}
 

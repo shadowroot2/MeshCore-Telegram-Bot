@@ -464,7 +464,7 @@ func TestMeshMessages(t *testing.T) {
 	// ответ (цитата) на сообщение с [Имя] упоминает контакт через @
 	m4 := &telegram.Message{Text: "да, согласен", From: telegram.From{FirstName: "Иван"},
 		ReplyToMessage: &telegram.Message{Text: "18:37 · SNR 8.5 dB\n[Валера] привет"}}
-	if got := meshMessages(m4, 100); len(got) != 1 || got[0] != "@Валера да, согласен" {
+	if got := meshMessages(m4, 100); len(got) != 1 || got[0] != "@[Валера] да, согласен" {
 		t.Fatalf("quote mention: %v", got)
 	}
 
@@ -510,21 +510,21 @@ func TestMeshMessagesSplitsLong(t *testing.T) {
 	if len(chunks) < 2 {
 		t.Fatalf("long message must split, got %d chunks", len(chunks))
 	}
-	if !strings.HasPrefix(chunks[0], "@Валера ") {
+	if !strings.HasPrefix(chunks[0], "@[Валера] ") {
 		t.Fatalf("first chunk must carry the mention: %q", chunks[0])
 	}
 	for i, ch := range chunks {
 		if len(ch) > companion.MaxChannelText {
 			t.Fatalf("chunk %d over budget: %d bytes", i, len(ch))
 		}
-		if i > 0 && strings.Contains(ch, "@Валера") {
+		if i > 0 && strings.Contains(ch, "@[Валера]") {
 			t.Fatalf("mention must ride the first chunk only: %q", ch)
 		}
 	}
 	joined := ""
 	for i, ch := range chunks {
 		if i == 0 {
-			ch = strings.TrimPrefix(ch, "@Валера ")
+			ch = strings.TrimPrefix(ch, "@[Валера] ")
 		}
 		joined += ch + " "
 	}
