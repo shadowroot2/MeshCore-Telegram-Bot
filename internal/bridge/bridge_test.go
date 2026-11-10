@@ -257,10 +257,10 @@ func TestProcessUpdatesRoutesByTopic(t *testing.T) {
 	}
 
 	ch, dm := r.texts()
-	if len(ch) != 2 || ch[0] != "А: в General" || ch[1] != "Б: в канал" {
+	if len(ch) != 2 || ch[0] != "в General" || ch[1] != "в канал" {
 		t.Fatalf("channel sends %v", ch)
 	}
-	if len(dm) != 1 || dm[0] != "В: в личку" {
+	if len(dm) != 1 || dm[0] != "в личку" {
 		t.Fatalf("dm sends %v", dm)
 	}
 
@@ -359,6 +359,12 @@ func TestFormatForTelegram(t *testing.T) {
 	if got := formatForTelegram(m4, ""); got != "SNR 8.5 dB\nбез часов" {
 		t.Fatalf("got %q", got)
 	}
+
+	// маркеры зеркал (джойстик/автоматика) вычищаются
+	m5 := msg("(>>✓) ShadoW: test", 0, 0, false)
+	if got := formatForTelegram(m5, ""); got != "[ShadoW] test" {
+		t.Fatalf("mirror marker: %q", got)
+	}
 }
 
 func TestQuotedContact(t *testing.T) {
@@ -395,7 +401,7 @@ func TestFormatHeard(t *testing.T) {
 
 func TestMeshMessages(t *testing.T) {
 	m := &telegram.Message{Text: "  привет  ", From: telegram.From{FirstName: "Иван"}}
-	if got := meshMessages(m, 100); len(got) != 1 || got[0] != "Иван: привет" {
+	if got := meshMessages(m, 100); len(got) != 1 || got[0] != "привет" {
 		t.Fatalf("got %v", got)
 	}
 
@@ -404,27 +410,22 @@ func TestMeshMessages(t *testing.T) {
 		t.Fatalf("whitespace-only must be skipped, got %v", got)
 	}
 
-	m3 := &telegram.Message{Text: "текст", From: telegram.From{FirstName: strings.Repeat("Д", 40)}}
-	got := meshMessages(m3, 100)
-	if len(got) != 1 || !strings.HasSuffix(got[0], ": текст") {
-		t.Fatalf("body must survive a long name, got %v", got)
-	}
-	name := strings.TrimSuffix(got[0], ": текст")
-	if len(name) > maxNameLen {
-		t.Fatalf("name not capped: %d bytes", len(name))
+	m3 := &telegram.Message{Text: "просто текст", From: telegram.From{FirstName: strings.Repeat("Д", 40)}}
+	if got := meshMessages(m3, 100); len(got) != 1 || got[0] != "просто текст" {
+		t.Fatalf("nick must not leak into mesh: %v", got)
 	}
 
 	// ответ (цитата) на сообщение с [Имя] упоминает контакт через @
 	m4 := &telegram.Message{Text: "да, согласен", From: telegram.From{FirstName: "Иван"},
 		ReplyToMessage: &telegram.Message{Text: "18:37 · SNR 8.5 dB\n[Валера] привет"}}
-	if got := meshMessages(m4, 100); len(got) != 1 || got[0] != "Иван: @Валера да, согласен" {
+	if got := meshMessages(m4, 100); len(got) != 1 || got[0] != "@Валера да, согласен" {
 		t.Fatalf("quote mention: %v", got)
 	}
 
 	// цитата без [Имя] — просто текст
 	m5 := &telegram.Message{Text: "да", From: telegram.From{FirstName: "Иван"},
 		ReplyToMessage: &telegram.Message{Text: "18:37\nпросто текст"}}
-	if got := meshMessages(m5, 100); len(got) != 1 || got[0] != "Иван: да" {
+	if got := meshMessages(m5, 100); len(got) != 1 || got[0] != "да" {
 		t.Fatalf("plain quote: %v", got)
 	}
 }
@@ -463,15 +464,12 @@ func TestMeshMessagesSplitsLong(t *testing.T) {
 	if len(chunks) < 2 {
 		t.Fatalf("long message must split, got %d chunks", len(chunks))
 	}
-	if !strings.HasPrefix(chunks[0], "Иван: @Валера ") {
+	if !strings.HasPrefix(chunks[0], "@Валера ") {
 		t.Fatalf("first chunk must carry the mention: %q", chunks[0])
 	}
 	for i, ch := range chunks {
 		if len(ch) > companion.MaxChannelText {
 			t.Fatalf("chunk %d over budget: %d bytes", i, len(ch))
-		}
-		if !strings.HasPrefix(ch, "Иван: ") {
-			t.Fatalf("chunk %d must keep attribution: %q", i, ch)
 		}
 		if i > 0 && strings.Contains(ch, "@Валера") {
 			t.Fatalf("mention must ride the first chunk only: %q", ch)
@@ -479,7 +477,6 @@ func TestMeshMessagesSplitsLong(t *testing.T) {
 	}
 	joined := ""
 	for i, ch := range chunks {
-		ch = strings.TrimPrefix(ch, "Иван: ")
 		if i == 0 {
 			ch = strings.TrimPrefix(ch, "@Валера ")
 		}
@@ -487,22 +484,5 @@ func TestMeshMessagesSplitsLong(t *testing.T) {
 	}
 	if strings.Join(strings.Fields(joined), " ") != strings.Join(strings.Fields(body), " ") {
 		t.Fatal("chunks must preserve the full body")
-	}
-}
-
-func TestSenderName(t *testing.T) {
-	m := &telegram.Message{From: telegram.From{ID: 42, FirstName: "Иван", LastName: "Петров", Username: "iv"}}
-	if got := senderName(m); got != "Иван Петров" {
-		t.Fatalf("got %q", got)
-	}
-
-	m2 := &telegram.Message{From: telegram.From{Username: "iv"}}
-	if got := senderName(m2); got != "@iv" {
-		t.Fatalf("got %q", got)
-	}
-
-	m3 := &telegram.Message{From: telegram.From{ID: 42}}
-	if got := senderName(m3); got != "id 42" {
-		t.Fatalf("got %q", got)
 	}
 }

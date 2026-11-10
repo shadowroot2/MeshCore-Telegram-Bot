@@ -407,9 +407,13 @@ func quotedContact(text string) string {
 // the sending node) is left out rather than shown as epoch. dmName names the
 // contact for DMs, whose wire text carries no sender prefix.
 func formatForTelegram(m companion.Message, dmName string) string {
-	name, text := splitSender(m.Text)
+	// служебные маркеры зеркал (джойстик/автоматика) в TG не показываем
+	text := strings.TrimPrefix(m.Text, "(>>\u2713) ")
+	text = strings.TrimPrefix(text, "(>>\u2717) ")
+	text = strings.TrimPrefix(text, "(>>) ")
+	name, text := splitSender(text)
 	if name == "" {
-		name, text = dmName, m.Text
+		name = dmName
 	}
 	if name != "" {
 		text = "[" + name + "] " + text
@@ -447,9 +451,9 @@ func formatHeard(n int) string {
 }
 
 // meshMessages renders a Telegram message into one or more mesh texts, each
-// within budget bytes: "<name>: [@Имя] chunk". The quote mention rides the
-// first chunk only. Whitespace-only messages yield nothing; a very long
-// display name is cut so the body still fits.
+// within budget bytes. No sender prefix: the radio's node_name signs every
+// channel message already. A quote mention "@Имя" rides the first chunk only.
+// Whitespace-only messages yield nothing.
 func meshMessages(m *telegram.Message, budget int) []string {
 	body := strings.TrimSpace(m.Text)
 	if body == "" {
@@ -461,10 +465,8 @@ func meshMessages(m *telegram.Message, budget int) []string {
 			mention = "@" + who + " "
 		}
 	}
-	name := companion.Truncate(senderName(m), maxNameLen)
-	prefix := name + ": "
 
-	avail := budget - len(prefix) - len(mention)
+	avail := budget - len(mention)
 	if avail < 1 {
 		avail = 1
 	}
@@ -473,9 +475,9 @@ func meshMessages(m *telegram.Message, budget int) []string {
 	out := make([]string, 0, len(chunks))
 	for i, ch := range chunks {
 		if i == 0 {
-			out = append(out, prefix+mention+ch)
+			out = append(out, mention+ch)
 		} else {
-			out = append(out, prefix+ch)
+			out = append(out, ch)
 		}
 	}
 	return out
@@ -510,17 +512,6 @@ func splitText(text string, budget int) []string {
 		out = append(out, text)
 	}
 	return out
-}
-
-func senderName(m *telegram.Message) string {
-	name := strings.TrimSpace(m.From.FirstName + " " + m.From.LastName)
-	if name == "" && m.From.Username != "" {
-		name = "@" + m.From.Username
-	}
-	if name == "" {
-		name = fmt.Sprintf("id %d", m.From.ID)
-	}
-	return name
 }
 
 func plural(n int, one, few, many string) string {
