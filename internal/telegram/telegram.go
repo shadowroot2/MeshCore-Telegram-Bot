@@ -62,8 +62,9 @@ type From struct {
 }
 
 // SendMessage posts text into the chat; threadID > 0 routes it into a forum
-// topic (вкладка), 0 is the General topic.
-func (c *Client) SendMessage(text string, threadID int64) error {
+// topic (вкладка), 0 is the General topic. Returns the message id so the
+// caller can quote the message later.
+func (c *Client) SendMessage(text string, threadID int64) (int64, error) {
 	v := url.Values{
 		"chat_id": {strconv.FormatInt(c.chatID, 10)},
 		"text":    {text},
@@ -71,7 +72,13 @@ func (c *Client) SendMessage(text string, threadID int64) error {
 	if threadID > 0 {
 		v.Set("message_thread_id", strconv.FormatInt(threadID, 10))
 	}
-	return c.postMessage(v)
+	var res struct {
+		MessageID int64 `json:"message_id"`
+	}
+	if err := c.postMessage(v, &res); err != nil {
+		return 0, err
+	}
+	return res.MessageID, nil
 }
 
 func (c *Client) ReplyToMessage(threadID, replyToMsgID int64, text string) error {
@@ -83,7 +90,7 @@ func (c *Client) ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	if threadID > 0 {
 		v.Set("message_thread_id", strconv.FormatInt(threadID, 10))
 	}
-	return c.postMessage(v)
+	return c.postMessage(v, nil)
 }
 
 // CreateForumTopic makes a new вкладка in the forum group and returns its id.
@@ -148,10 +155,10 @@ var postRetryDelay = 2 * time.Second
 
 // postMessage sends a message with a few retries: a 429 or a network blip
 // would otherwise drop the mesh message for good.
-func (c *Client) postMessage(params url.Values) error {
+func (c *Client) postMessage(params url.Values, result any) error {
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		if err = c.call("sendMessage", params, nil); err == nil {
+		if err = c.call("sendMessage", params, result); err == nil {
 			return nil
 		}
 		if attempt < 2 {

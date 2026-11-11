@@ -94,6 +94,12 @@ func (s *stubRadio) RunCLI(line string) (string, error) {
 	return s.reply, s.replyEr
 }
 
+func (s *stubRadio) dmTexts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.dmSent...)
+}
+
 func (s *stubRadio) texts() ([]string, []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -125,21 +131,23 @@ type stubTG struct {
 	listed      map[string]int64 // имя вкладки -> thread id для ListForumTopics
 	sendFailN   int              // столько SendMessage подряд упадут с "not found"
 	editErr     error
+	msgIDs      []int64 // id отправленных сообщений
 }
 
 func (s *stubTG) ChatID() int64 { return -100500 }
 
 func (s *stubTG) GetUpdates(offset int64) ([]telegram.Update, error) { return nil, nil }
 
-func (s *stubTG) SendMessage(text string, threadID int64) error {
+func (s *stubTG) SendMessage(text string, threadID int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sendFailN > 0 {
 		s.sendFailN--
-		return errors.New("Bad Request: message thread not found")
+		return 0, errors.New("Bad Request: message thread not found")
 	}
 	s.sent = append(s.sent, outMsg{text, threadID})
-	return nil
+	s.msgIDs = append(s.msgIDs, int64(1000+len(s.sent)))
+	return int64(1000 + len(s.sent)), nil
 }
 
 func (s *stubTG) ReplyToMessage(threadID, replyToMsgID int64, text string) error {
@@ -192,6 +200,12 @@ func (s *stubTG) CreateForumTopic(name string) (int64, error) {
 }
 
 var errCreateTopic = errors.New("Too Many Requests: retry after 1")
+
+func (s *stubTG) ids() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.msgIDs...)
+}
 
 func (s *stubTG) log() ([]outMsg, []outReply, []string) {
 	s.mu.Lock()
@@ -1009,5 +1023,60 @@ func TestBindExistingFollowsUserRename(t *testing.T) {
 	e := b.topics.snapshot()["ch:0"]
 	if e.Name != "Мой друг" {
 		t.Fatalf("stored name = %q, want «Мой друг»", e.Name)
+	}
+}
+
+func TestLoRaCLICommandRunsAndReplies(t *testing.T) {
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{reply: "> 1.2.3", chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+
+	dm := companion.Message{Kind: companion.KindDM, Prefix: prefix,
+		Text: "$ ver", Time: 1}
+	if err := b.Deliver(dm); err != nil {
+		t.Fatal(err)
+	}
+
+	// команда выполняется в горутине — ждём фактов: цитата + DM отправителю
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sent, replies, _ := tg.log()
+		dm := r.dmTexts()
+		ids := tg.ids()
+		if len(sent) == 1 && len(replies) > 0 && len(dm) == 1 {
+			if !strings.Contains(sent[0].text, "$ ver") {
+				t.Fatalf("command must be forwarded to TG: %v", sent)
+			}
+			if replies[0].to != ids[0] || replies[0].text != "> 1.2.3" {
+				t.Fatalf("quoted reply: %+v", replies[0])
+			}
+			if dm[0] != "> 1.2.3" {
+				t.Fatalf("DM back to sender: %v", dm)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout: sent=%v replies=%v dm=%v", sent, replies, dm)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestPlainDMNotExecuted(t *testing.T) {
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{reply: "> x", chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+
+	dm := companion.Message{Kind: companion.KindDM, Prefix: prefix,
+		Text: "обычное сообщение", Time: 1}
+	if err := b.Deliver(dm); err != nil {
+		t.Fatal(err)
+	}
+	if r.cliCalls != 0 {
+		t.Fatalf("plain DM must not run CLI, calls=%d", r.cliCalls)
 	}
 }

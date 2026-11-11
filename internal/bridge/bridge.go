@@ -49,7 +49,7 @@ type radio interface {
 type Telegram interface {
 	ChatID() int64
 	GetUpdates(offset int64) ([]telegram.Update, error)
-	SendMessage(text string, threadID int64) error
+	SendMessage(text string, threadID int64) (int64, error)
 	ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	CreateForumTopic(name string) (int64, error)
 	EditForumTopic(threadID int64, name string) error
@@ -287,7 +287,7 @@ func (b *Bridge) announce(info companion.SessionInfo) {
 	}
 	text := fmt.Sprintf("🚀 MeshCore bot запущен и подключен к «%s» (%s) · каналов: %d · контактов: %d",
 		info.NodeName, info.Addr, len(info.Channels), len(info.Contacts))
-	if err := b.tg.SendMessage(text, thread); err != nil {
+	if _, err := b.tg.SendMessage(text, thread); err != nil {
 		// не помечаем отправленным — попробуем при следующем подключении
 		log.Printf("telegram: %v", err)
 		return
@@ -385,15 +385,34 @@ func (b *Bridge) Deliver(m companion.Message) error {
 	t := b.targetFor(m)
 	thread := b.topics.ensure(t.key, t.name, b.tg)
 	text := formatForTelegram(m, b.location())
-	err := b.tg.SendMessage(text, thread)
-	if !isNotFound(err) {
+	msgID, err := b.tg.SendMessage(text, thread)
+	if isNotFound(err) {
+		// вкладку удалили в Telegram — маппинг протух, создаём заново
+		log.Printf("topics: %q was deleted in Telegram, recreating", t.name)
+		b.topics.invalidate(t.key)
+		thread = b.topics.ensure(t.key, t.name, b.tg)
+		msgID, err = b.tg.SendMessage(text, thread)
+	}
+	if err != nil {
 		return err
 	}
-	// вкладку удалили в Telegram — маппинг протух, создаём заново
-	log.Printf("topics: %q was deleted in Telegram, recreating", t.name)
-	b.topics.invalidate(t.key)
-	thread = b.topics.ensure(t.key, t.name, b.tg)
-	return b.tg.SendMessage(text, thread)
+	// "$ команда" из LoRa в личном сообщении — выполнить на радио;
+	// результат вернётся цитатой в TG и DM отправителю
+	if m.Kind == companion.KindDM {
+		if cmd := cliFrom(m.Text); cmd != "" {
+			go b.runMeshCLI(m, cmd, msgID, thread)
+		}
+	}
+	return nil
+}
+
+// cliFrom вырезает команду из текста с префиксом "$ ".
+func cliFrom(text string) string {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "$") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(t, "$"))
 }
 
 // contactName возвращает имя контакта; для неизвестного/безымянного префикса
@@ -547,7 +566,7 @@ func (b *Bridge) normalizePublicChannel(idx byte, name string, secret [16]byte) 
 	}
 	log.Printf("topics: channel %q key set to the name-derived public key", name)
 	thread, _ := b.topics.thread(channelKey(idx))
-	if err := b.tg.SendMessage(fmt.Sprintf("🔑 ключ канала «%s» приведён к публичному "+
+	if _, err := b.tg.SendMessage(fmt.Sprintf("🔑 ключ канала «%s» приведён к публичному "+
 		"(добавляется по имени)", name), thread); err != nil {
 		log.Printf("telegram: %v", err)
 	}
@@ -613,7 +632,7 @@ func (b *Bridge) linkTopic(threadID int64, name string) bool {
 			msg = fmt.Sprintf("📡 канал «%s» создан на радио (слот %d)\nКлюч: %x",
 				name, idx, secret)
 		}
-		if err := b.tg.SendMessage(msg, threadID); err != nil {
+		if _, err := b.tg.SendMessage(msg, threadID); err != nil {
 			log.Printf("telegram: %v", err)
 		}
 		log.Printf("topics: channel %q -> idx %d created", name, idx)
@@ -763,6 +782,16 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 				continue
 			}
 		}
+		// "$ команда" в личных сообщениях — CLI радио, а не mesh-текст;
+		// обычные ЛС идут контакту как раньше
+		if tgt.kind == companion.KindDM && strings.HasPrefix(body, "$") {
+			cmd := strings.TrimSpace(strings.TrimPrefix(body, "$"))
+			if cmd != "" {
+				b.runCLICommand(m, cmd)
+			}
+			offset = u.UpdateID + 1
+			continue
+		}
 		budget := companion.MaxDMText
 		if tgt.kind == companion.KindChannel {
 			budget = companion.MaxChannelText
@@ -790,6 +819,91 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 		}
 	}
 	return offset
+}
+
+// cliResult — текст ответа на команду CLI.
+func cliResult(out string, err error) string {
+	switch {
+	case err != nil:
+		return "❌ " + err.Error()
+	case strings.TrimSpace(out) == "":
+		return "✓ выполнено"
+	default:
+		return out
+	}
+}
+
+// runMeshCLI выполняет команду из LoRa: результат уходит цитированием в TG
+// (на пересланную команду) и ответным личным сообщением отправителю по LoRa.
+func (b *Bridge) runMeshCLI(m companion.Message, cmd string, replyTo, thread int64) {
+	b.mu.Lock()
+	r := b.r
+	b.mu.Unlock()
+
+	out := ""
+	var err error
+	if r == nil {
+		err = errors.New("радио не подключено")
+	} else {
+		log.Printf("cli: $ %s (из LoRa)", cmd)
+		out, err = r.RunCLI(cmd)
+	}
+	text := cliResult(out, err)
+
+	for _, part := range splitText(text, 4000) {
+		if perr := b.tg.ReplyToMessage(thread, replyTo, part); perr != nil {
+			log.Printf("telegram: %v", perr)
+		}
+	}
+	b.sendDM(m.Prefix, text)
+}
+
+// sendDM отвечает отправителю личным сообщением по LoRa.
+func (b *Bridge) sendDM(prefix [6]byte, text string) {
+	b.mu.Lock()
+	r := b.r
+	b.mu.Unlock()
+	if r == nil {
+		return
+	}
+	for _, part := range splitText(text, companion.MaxDMText) {
+		ts := b.nextTs()
+		if err := r.SendContactText(prefix, part, ts); err != nil {
+			log.Printf("cli: ответ в ЛС: %v", err)
+			return
+		}
+	}
+}
+
+// nextTs — очередной timestamp для разовой отправки.
+func (b *Bridge) nextTs() uint32 {
+	b.tsMu.Lock()
+	defer b.tsMu.Unlock()
+	return b.nextTsLocked()
+}
+
+// runCLICommand выполняет команду CLI радио и отвечает цитированием на
+// сообщение с командой.
+func (b *Bridge) runCLICommand(m *telegram.Message, cmd string) {
+	b.mu.Lock()
+	r := b.r
+	b.mu.Unlock()
+
+	out := ""
+	var err error
+	if r == nil {
+		err = errors.New("радио не подключено")
+	} else {
+		log.Printf("cli: $ %s", cmd)
+		out, err = r.RunCLI(cmd)
+	}
+	text := cliResult(out, err)
+	// длинные ответы (gps diag и т.п.) уходят частями, каждый реплаем
+	for _, part := range splitText(text, 4000) {
+		if perr := b.tg.ReplyToMessage(m.MessageThreadID, m.MessageID, part); perr != nil {
+			log.Printf("telegram: %v", perr)
+		}
+	}
 }
 
 // checkHeard replies to the user's message with how many repeaters repeated

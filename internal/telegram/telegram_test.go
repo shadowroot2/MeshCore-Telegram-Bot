@@ -87,10 +87,10 @@ func TestSendMessageParams(t *testing.T) {
 	rec := &tgRecorder{}
 	c := newTGFake(t, rec)
 
-	if err := c.SendMessage("hello", 0); err != nil {
+	if _, err := c.SendMessage("hello", 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.SendMessage("в канал", 7); err != nil {
+	if _, err := c.SendMessage("в канал", 7); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.ReplyToMessage(7, 70, "2 репиттера услышали"); err != nil {
@@ -149,7 +149,7 @@ func TestPostMessageRetriesThenSucceeds(t *testing.T) {
 	rec := &tgRecorder{failN: 2}
 	c := newTGFake(t, rec)
 
-	if err := c.SendMessage("flaky", 0); err != nil {
+	if _, err := c.SendMessage("flaky", 0); err != nil {
 		t.Fatalf("must survive two failures: %v", err)
 	}
 	if got := len(rec.take()); got != 3 {
@@ -165,7 +165,7 @@ func TestPostMessageGivesUp(t *testing.T) {
 	rec := &tgRecorder{failN: 3}
 	c := newTGFake(t, rec)
 
-	err := c.SendMessage("dead", 0)
+	_, err := c.SendMessage("dead", 0)
 	if err == nil || !strings.Contains(err.Error(), "Too Many Requests") {
 		t.Fatalf("want retryable error surfaced, got %v", err)
 	}
