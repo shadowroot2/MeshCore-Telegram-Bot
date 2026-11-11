@@ -872,8 +872,8 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 				continue
 			}
 		}
-		// "$ команда" в личных чатах (вкладка ЛС) — CLI радио; в канале —
-		// обычный текст для mesh
+		// "$ команда" в личных чатах (вкладка ЛС) — CLI радио, в LoRa ничего
+		// не уходит; в канале — обычный текст для mesh
 		if cmd := cliFrom(body); cmd != "" && tgt.kind == companion.KindDM {
 			if !b.canCommand(m.From.ID) {
 				b.replyTo(m, "❌ нет доступа к командам")

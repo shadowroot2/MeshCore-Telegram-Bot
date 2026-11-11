@@ -1334,4 +1334,7 @@ func TestDMTopicCommands(t *testing.T) {
 	if len(ch) != 0 {
 		t.Fatalf("command must not leak into mesh: %v", ch)
 	}
+	if dm := r.dmTexts(); len(dm) != 0 {
+		t.Fatalf("command must not send anything over LoRa: %v", dm)
+	}
 }
