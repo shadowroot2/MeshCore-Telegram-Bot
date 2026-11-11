@@ -926,6 +926,7 @@ func (b *Bridge) startMeshCLI(m companion.Message, cmd string, forwardedID, thre
 	if name == "" {
 		name = "dm-" + fmt.Sprintf("%x", m.Prefix)[:4]
 	}
+	log.Printf("cli: $ %s от %s (из LoRa)", cmd, name)
 	switch b.admins.get(m.Prefix) {
 	case "allow":
 		go b.runMeshCLI(m.Prefix, cmd, forwardedID, thread)
@@ -935,9 +936,16 @@ func (b *Bridge) startMeshCLI(m companion.Message, cmd string, forwardedID, thre
 		chat, pThread := b.promptTarget(thread)
 		id, err := b.tg.PostInChat(chat, pThread, 0, approvalPrompt(name, m.Prefix))
 		if err != nil {
-			log.Printf("telegram: %v", err)
-			return
+			// личка админа недоступна (не нажал /start) — заявка в вкладку ЛС
+			log.Printf("cli: заявка в личку не ушла (%v), публикую в вкладке ЛС", err)
+			chat, pThread = b.tg.ChatID(), thread
+			id, err = b.tg.PostInChat(chat, pThread, 0, approvalPrompt(name, m.Prefix))
+			if err != nil {
+				log.Printf("telegram: %v", err)
+				return
+			}
 		}
+		log.Printf("cli: заявка на $ %s отправлена (%s)", cmd, name)
 		b.setPending(m.Prefix, pendingApproval{
 			cmd: cmd, name: name, prefix: m.Prefix,
 			promptChat: chat, promptMsg: id, promptThread: pThread,

@@ -142,6 +142,7 @@ type stubTG struct {
 	msgIDs       []int64        // id отправленных сообщений
 	members      map[int64]bool // кто состоит в группе
 	memberChecks []int64
+	failChat     int64 // PostInChat в этот чат падает
 }
 
 func (s *stubTG) ChatID() int64 { return -100500 }
@@ -158,6 +159,9 @@ func (s *stubTG) PostInChat(chatID, threadID, replyTo int64, text string) (int64
 	if s.sendFailN > 0 {
 		s.sendFailN--
 		return 0, errors.New("Bad Request: message thread not found")
+	}
+	if s.failChat != 0 && chatID == s.failChat {
+		return 0, errors.New("Forbidden: bot can't initiate conversation")
 	}
 	s.sent = append(s.sent, outMsg{text, threadID, chatID, replyTo})
 	s.msgIDs = append(s.msgIDs, int64(1000+len(s.sent)))
@@ -1283,4 +1287,31 @@ func TestAdminsPersist(t *testing.T) {
 		t.Fatalf("admins must survive restart, got %q", b.get(prefix))
 	}
 	_ = path
+}
+
+func TestPromptFallsBackToTopic(t *testing.T) {
+	// личка админа недоступна (нет /start) — заявка должна упасть во вкладку ЛС
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{failChat: 500}
+	b := newTestBridge(t, tg, r)
+	b.adminID = 500
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b.topics.bind("dm:deadbeef0001", 12, "Валера")
+
+	b.Deliver(companion.Message{Kind: companion.KindDM, Prefix: prefix, Text: "$ ver", Time: 1})
+
+	sent, _, _ := tg.log()
+	var prompt *outMsg
+	for i := range sent {
+		if strings.Contains(sent[i].text, "Разрешить контакту") {
+			prompt = &sent[i]
+		}
+	}
+	if prompt == nil {
+		t.Fatalf("prompt missing: %v", sent)
+	}
+	if prompt.chat != -100500 || prompt.thread != 12 {
+		t.Fatalf("prompt must fall back to the ЛС topic, got chat=%d thread=%d", prompt.chat, prompt.thread)
+	}
 }
