@@ -1304,3 +1304,34 @@ func TestAdminsPersist(t *testing.T) {
 	}
 	_ = path
 }
+
+func TestDMTopicCommands(t *testing.T) {
+	// "$" в вкладке ЛС (личный чат) из Telegram — команда, ответ цитатой
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{reply: "> 2.0", chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{members: map[int64]bool{42: true}}
+	b := newTestBridge(t, tg, r)
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b.topics.bind("dm:deadbeef0001", 30, "Валера")
+
+	updates := []telegram.Update{
+		{UpdateID: 1, Message: &telegram.Message{MessageID: 11, Text: "$ ver",
+			MessageThreadID: 30, IsTopicMessage: true,
+			Chat: telegram.Chat{ID: -100500, Type: "supergroup"},
+			From: telegram.From{ID: 42, FirstName: "Ю"}}},
+	}
+	if next := processUpdates(b, 0, updates); next != 2 {
+		t.Fatalf("offset = %d", next)
+	}
+	if r.cliCount() != 1 {
+		t.Fatalf("DM-topic $ must run CLI, calls=%d", r.cliCount())
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || sent[0].text != "> 2.0" || sent[0].replyTo != 11 {
+		t.Fatalf("quoted result in the topic: %v", sent)
+	}
+	ch, _ := r.texts()
+	if len(ch) != 0 {
+		t.Fatalf("command must not leak into mesh: %v", ch)
+	}
+}
