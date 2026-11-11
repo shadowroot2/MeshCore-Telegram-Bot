@@ -96,6 +96,21 @@ func (c *Client) ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	return err
 }
 
+// IsGroupMember — состоит ли пользователь в группе-мосте.
+func (c *Client) IsGroupMember(userID int64) (bool, error) {
+	var res struct {
+		Status string `json:"status"`
+	}
+	err := c.call("getChatMember", url.Values{
+		"chat_id": {strconv.FormatInt(c.chatID, 10)},
+		"user_id": {strconv.FormatInt(userID, 10)},
+	}, &res)
+	if err != nil {
+		return false, err
+	}
+	return res.Status != "left" && res.Status != "kicked", nil
+}
+
 // CreateForumTopic makes a new вкладка in the forum group and returns its id.
 func (c *Client) CreateForumTopic(name string) (int64, error) {
 	var res struct {

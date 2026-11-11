@@ -53,6 +53,7 @@ type Telegram interface {
 	SendMessage(text string, threadID int64) (int64, error)
 	ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	PostInChat(chatID, threadID, replyTo int64, text string) (int64, error)
+	IsGroupMember(userID int64) (bool, error)
 	CreateForumTopic(name string) (int64, error)
 	EditForumTopic(threadID int64, name string) error
 	GetForumTopic(threadID int64) (string, error)
@@ -825,6 +826,18 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 			offset = u.UpdateID + 1
 			continue
 		}
+		// личка бота (любой): команды "$"
+		if m.Chat.Type == "private" {
+			if cmd := cliFrom(strings.TrimSpace(m.Text)); cmd != "" {
+				if !b.canCommand(m.From.ID) {
+					b.replyTo(m, "❌ нет доступа к командам")
+				} else {
+					b.replyTo(m, b.execCLI(cmd))
+				}
+			}
+			offset = u.UpdateID + 1
+			continue
+		}
 		if m.Chat.ID != b.tg.ChatID() {
 			offset = u.UpdateID + 1
 			continue
@@ -928,7 +941,7 @@ func (b *Bridge) startMeshCLI(m companion.Message, cmd string, forwardedID, thre
 		b.sendDM(m.Prefix, "❌ Вам запрещено выполнять команды")
 	default:
 		chat, pThread := b.promptTarget(thread)
-		id, err := b.tg.PostInChat(chat, pThread, 0, approvalPrompt(name, m.Prefix))
+		id, err := b.tg.PostInChat(chat, pThread, 0, approvalPrompt(name))
 		if err != nil {
 			log.Printf("telegram: заявка не ушла: %v", err)
 			return
@@ -972,6 +985,20 @@ func (b *Bridge) nextTs() uint32 {
 	return b.nextTsLocked()
 }
 
+// canCommand — имеет ли пользователь право на команды "$" из Telegram:
+// ADMIN_ID, а если не задан — любой участник группы.
+func (b *Bridge) canCommand(userID int64) bool {
+	if b.adminID != 0 {
+		return userID == b.adminID
+	}
+	ok, err := b.tg.IsGroupMember(userID)
+	if err != nil {
+		log.Printf("admin: проверка участия: %v", err)
+		return false
+	}
+	return ok
+}
+
 // execCLI выполняет команду CLI на радио и возвращает готовый текст ответа.
 func (b *Bridge) execCLI(cmd string) string {
 	b.mu.Lock()
@@ -1004,7 +1031,7 @@ func (b *Bridge) tryApproval(m *telegram.Message) bool {
 	if m.ReplyToMessage == nil {
 		return false
 	}
-	prefix, ok := promptPrefix(m.ReplyToMessage.Text)
+	prefix, ok := b.pendingPrefix(m.ReplyToMessage.MessageID, m.ReplyToMessage.Text)
 	if !ok {
 		return false
 	}
@@ -1026,17 +1053,9 @@ func (b *Bridge) decideApproval(m *telegram.Message, prefix [6]byte) {
 		b.admins.set(prefix, "allow")
 		b.replyTo(m, fmt.Sprintf("💾 %s сохранен как администратор!", name))
 		if p, ok := b.takePending(prefix); ok {
-			text := b.execCLI(p.cmd)
-			// цитатой на заявку + в ЛС-вкладку + DM отправителю по LoRa
-			if _, err := b.tg.PostInChat(p.promptChat, p.promptThread, p.promptMsg, text); err != nil {
-				log.Printf("telegram: %v", err)
-			}
-			for _, part := range splitText(text, 4000) {
-				if err := b.tg.ReplyToMessage(p.thread, p.forwardedID, part); err != nil {
-					log.Printf("telegram: %v", err)
-				}
-			}
-			b.sendDM(p.prefix, text)
+			// результат — как для обычной команды: цитата на "$ команда"
+			// и ответное ЛС отправителю по LoRa (без дубля к заявке)
+			go b.runMeshCLI(p.prefix, p.cmd, p.forwardedID, p.thread)
 		}
 		return
 	}
@@ -1068,26 +1087,46 @@ func (b *Bridge) dropPending(prefix [6]byte) {
 }
 
 // approvalPrompt — заявка на разрешение команд от контакта.
-func approvalPrompt(name string, prefix [6]byte) string {
-	return fmt.Sprintf("🔑 Разрешить контакту %s %x выполнять команды?", name, prefix)
+func approvalPrompt(name string) string {
+	return fmt.Sprintf("🔑 Разрешить контакту %s выполнять команды?", name)
 }
 
-// promptPrefix вытаскивает хэш контакта из текста заявки.
-func promptPrefix(text string) ([6]byte, bool) {
+// promptName вытаскивает имя контакта из текста заявки.
+func promptName(text string) string {
+	const head = "Разрешить контакту "
+	const tail = " выполнять команды?"
+	if !strings.HasPrefix(text, head) || !strings.HasSuffix(text, tail) {
+		return ""
+	}
+	return strings.TrimSpace(text[len(head) : len(text)-len(tail)])
+}
+
+// pendingPrefix находит контакт по сообщению-заявке: сначала по id (заявка
+// жива в памяти), иначе по имени из текста — фолбэк после рестарта бота.
+func (b *Bridge) pendingPrefix(promptMsgID int64, promptText string) ([6]byte, bool) {
 	var prefix [6]byte
-	if !strings.Contains(text, "Разрешить контакту") {
+	b.pMu.Lock()
+	for _, p := range b.pending {
+		if p.promptMsg == promptMsgID {
+			prefix = p.prefix
+			b.pMu.Unlock()
+			return prefix, true
+		}
+	}
+	b.pMu.Unlock()
+
+	name := promptName(promptText)
+	if name == "" {
 		return prefix, false
 	}
-	fields := strings.Fields(text)
-	if len(fields) < 5 {
-		return prefix, false
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for pfx, n := range b.info.Contacts {
+		if n == name {
+			return pfx, true
+		}
 	}
-	raw, err := hex.DecodeString(fields[len(fields)-3])
-	if err != nil || len(raw) != len(prefix) {
-		return prefix, false
-	}
-	copy(prefix[:], raw)
-	return prefix, true
+	return prefix, false
 }
 
 // checkHeard replies to the user's message with how many repeaters repeated

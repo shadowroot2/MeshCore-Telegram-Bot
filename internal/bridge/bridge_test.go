@@ -1140,19 +1140,32 @@ func privUpdate(id int64, text string) telegram.Update {
 	}}
 }
 
-func TestPrivateChatIgnored(t *testing.T) {
-	// личка бота не используется вовсе: ни команд, ни ответов
+func TestPrivateChatCommands(t *testing.T) {
+	// команды "$" работают в любом личном чате с ботом
 	r := &stubRadio{reply: "> 1.0"}
-	tg := &stubTG{}
+	tg := &stubTG{members: map[int64]bool{42: true}}
 	b := newTestBridge(t, tg, r)
 
 	processUpdates(b, 0, []telegram.Update{privUpdate(42, "$ ver")})
-	processUpdates(b, 0, []telegram.Update{privUpdate(42, "да")})
-	if r.cliCount() != 0 {
-		t.Fatalf("private chat must not run CLI, calls=%d", r.cliCount())
+	if r.cliCount() != 1 {
+		t.Fatalf("private chat must run CLI, calls=%d", r.cliCount())
 	}
-	if sent, _, _ := tg.log(); len(sent) != 0 {
-		t.Fatalf("no output expected from the private chat: %v", sent)
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || sent[0].text != "> 1.0" || sent[0].replyTo != 42 {
+		t.Fatalf("quoted result: %v", sent)
+	}
+
+	// не участник группы и не ADMIN_ID — отказ
+	r2 := &stubRadio{reply: "> x"}
+	tg2 := &stubTG{members: map[int64]bool{}}
+	b2 := newTestBridge(t, tg2, r2)
+	processUpdates(b2, 0, []telegram.Update{privUpdate(7, "$ ver")})
+	if r2.cliCount() != 0 {
+		t.Fatal("stranger must not run CLI")
+	}
+	sent2, _, _ := tg2.log()
+	if len(sent2) != 1 || !strings.Contains(sent2[0].text, "нет доступа") {
+		t.Fatalf("refusal: %v", sent2)
 	}
 }
 
@@ -1174,8 +1187,8 @@ func TestLoRaApprovalFlow(t *testing.T) {
 		t.Fatalf("forwarded + prompt expected, got %v", sent)
 	}
 	prompt := sent[1]
-	if prompt.chat != -100500 || !strings.Contains(prompt.text, "Разрешить контакту Валера deadbeef0001") {
-		t.Fatalf("prompt must live in the ЛС topic: %v", prompt)
+	if prompt.chat != -100500 || !strings.Contains(prompt.text, "Разрешить контакту Валера выполнять команды?") || strings.Contains(prompt.text, "deadbeef") {
+		t.Fatalf("prompt without hash, in the ЛС topic: %v", prompt)
 	}
 	if r.cliCount() != 0 {
 		t.Fatal("command must wait for approval")
@@ -1189,31 +1202,31 @@ func TestLoRaApprovalFlow(t *testing.T) {
 		ReplyToMessage: &telegram.Message{MessageID: promptID(tg), Text: prompt.text}}
 	processUpdates(b, 0, []telegram.Update{{UpdateID: 1, Message: reply}})
 
-	if r.cliCount() != 1 {
-		t.Fatalf("approved command must run, calls=%d", r.cliCount())
-	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		sentNow, reps, _ := tg.log()
-		var saved, result bool
+		saved, results := false, 0
 		for _, o := range sentNow {
 			if strings.Contains(o.text, "сохранен как администратор") {
 				saved = true
 			}
 			if o.text == "> 1.2.3" {
-				result = true
+				results++
 			}
 		}
 		for _, o := range reps {
 			if o.text == "> 1.2.3" {
-				result = true
+				results++
+				if o.to == promptID(tg) {
+					t.Fatalf("result must not quote the approval prompt: %+v", o)
+				}
 			}
 		}
-		if saved && result {
+		if saved && results == 1 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("saved=%v result=%v sent=%v replies=%v", saved, result, sentNow, reps)
+			t.Fatalf("saved=%v results=%d sent=%v replies=%v", saved, results, sentNow, reps)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
