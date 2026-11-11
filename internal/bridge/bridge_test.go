@@ -1140,18 +1140,19 @@ func privUpdate(id int64, text string) telegram.Update {
 	}}
 }
 
-func TestPrivateChatIgnoresDollar(t *testing.T) {
-	// команды "$" приходят только из LoRa-ЛС; в личке бота они не выполняются
+func TestPrivateChatIgnored(t *testing.T) {
+	// личка бота не используется вовсе: ни команд, ни ответов
 	r := &stubRadio{reply: "> 1.0"}
 	tg := &stubTG{}
 	b := newTestBridge(t, tg, r)
 
 	processUpdates(b, 0, []telegram.Update{privUpdate(42, "$ ver")})
+	processUpdates(b, 0, []telegram.Update{privUpdate(42, "да")})
 	if r.cliCount() != 0 {
 		t.Fatalf("private chat must not run CLI, calls=%d", r.cliCount())
 	}
 	if sent, _, _ := tg.log(); len(sent) != 0 {
-		t.Fatalf("no output expected for $ in private chat: %v", sent)
+		t.Fatalf("no output expected from the private chat: %v", sent)
 	}
 }
 
@@ -1173,16 +1174,17 @@ func TestLoRaApprovalFlow(t *testing.T) {
 		t.Fatalf("forwarded + prompt expected, got %v", sent)
 	}
 	prompt := sent[1]
-	if prompt.chat != 500 || !strings.Contains(prompt.text, "Разрешить контакту Валера deadbeef0001") {
-		t.Fatalf("prompt to admin private chat: %v", prompt)
+	if prompt.chat != -100500 || !strings.Contains(prompt.text, "Разрешить контакту Валера deadbeef0001") {
+		t.Fatalf("prompt must live in the ЛС topic: %v", prompt)
 	}
 	if r.cliCount() != 0 {
 		t.Fatal("command must wait for approval")
 	}
 
-	// админ отвечает «да» на заявку
+	// админ отвечает «да» на заявку — в той же вкладке ЛС
 	reply := &telegram.Message{MessageID: 9, Text: "да",
-		Chat:           telegram.Chat{ID: 500, Type: "private"},
+		MessageThreadID: prompt.thread, IsTopicMessage: true,
+		Chat:           telegram.Chat{ID: -100500, Type: "supergroup"},
 		From:           telegram.From{ID: 500},
 		ReplyToMessage: &telegram.Message{MessageID: promptID(tg), Text: prompt.text}}
 	processUpdates(b, 0, []telegram.Update{{UpdateID: 1, Message: reply}})
@@ -1252,7 +1254,8 @@ func TestLoRaApprovalDenied(t *testing.T) {
 	prompt := sent[1]
 
 	reply := &telegram.Message{MessageID: 9, Text: "нет",
-		Chat:           telegram.Chat{ID: 500, Type: "private"},
+		MessageThreadID: prompt.thread, IsTopicMessage: true,
+		Chat:           telegram.Chat{ID: -100500, Type: "supergroup"},
 		From:           telegram.From{ID: 500},
 		ReplyToMessage: &telegram.Message{MessageID: promptID(tg), Text: prompt.text}}
 	processUpdates(b, 0, []telegram.Update{{UpdateID: 1, Message: reply}})
@@ -1287,31 +1290,4 @@ func TestAdminsPersist(t *testing.T) {
 		t.Fatalf("admins must survive restart, got %q", b.get(prefix))
 	}
 	_ = path
-}
-
-func TestPromptFallsBackToTopic(t *testing.T) {
-	// личка админа недоступна (нет /start) — заявка должна упасть во вкладку ЛС
-	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
-	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
-	tg := &stubTG{failChat: 500}
-	b := newTestBridge(t, tg, r)
-	b.adminID = 500
-	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
-	b.topics.bind("dm:deadbeef0001", 12, "Валера")
-
-	b.Deliver(companion.Message{Kind: companion.KindDM, Prefix: prefix, Text: "$ ver", Time: 1})
-
-	sent, _, _ := tg.log()
-	var prompt *outMsg
-	for i := range sent {
-		if strings.Contains(sent[i].text, "Разрешить контакту") {
-			prompt = &sent[i]
-		}
-	}
-	if prompt == nil {
-		t.Fatalf("prompt missing: %v", sent)
-	}
-	if prompt.chat != -100500 || prompt.thread != 12 {
-		t.Fatalf("prompt must fall back to the ЛС topic, got chat=%d thread=%d", prompt.chat, prompt.thread)
-	}
 }

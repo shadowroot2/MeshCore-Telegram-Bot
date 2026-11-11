@@ -825,12 +825,6 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 			offset = u.UpdateID + 1
 			continue
 		}
-		// личка бота: команды "$" и согласования
-		if m.Chat.Type == "private" {
-			b.handlePrivate(m)
-			offset = u.UpdateID + 1
-			continue
-		}
 		if m.Chat.ID != b.tg.ChatID() {
 			offset = u.UpdateID + 1
 			continue
@@ -936,16 +930,10 @@ func (b *Bridge) startMeshCLI(m companion.Message, cmd string, forwardedID, thre
 		chat, pThread := b.promptTarget(thread)
 		id, err := b.tg.PostInChat(chat, pThread, 0, approvalPrompt(name, m.Prefix))
 		if err != nil {
-			// личка админа недоступна (не нажал /start) — заявка в вкладку ЛС
-			log.Printf("cli: заявка в личку не ушла (%v), публикую в вкладке ЛС", err)
-			chat, pThread = b.tg.ChatID(), thread
-			id, err = b.tg.PostInChat(chat, pThread, 0, approvalPrompt(name, m.Prefix))
-			if err != nil {
-				log.Printf("telegram: %v", err)
-				return
-			}
+			log.Printf("telegram: заявка не ушла: %v", err)
+			return
 		}
-		log.Printf("cli: заявка на $ %s отправлена (%s)", cmd, name)
+		log.Printf("cli: заявка на $ %s отправлена в вкладку ЛС (%s)", cmd, name)
 		b.setPending(m.Prefix, pendingApproval{
 			cmd: cmd, name: name, prefix: m.Prefix,
 			promptChat: chat, promptMsg: id, promptThread: pThread,
@@ -954,12 +942,9 @@ func (b *Bridge) startMeshCLI(m companion.Message, cmd string, forwardedID, thre
 	}
 }
 
-// promptTarget: заявка уходит админу в личку, а если ADMIN_ID не задан —
-// во вкладку ЛС контакта в группе.
+// promptTarget: заявка всегда живёт в вкладке ЛС контакта — весь диалог
+// (вопрос, «да», результат) идёт в рамках личного сообщения, без лички бота.
 func (b *Bridge) promptTarget(thread int64) (chatID, threadID int64) {
-	if b.adminID != 0 {
-		return b.adminID, 0
-	}
 	return b.tg.ChatID(), thread
 }
 
@@ -1013,15 +998,6 @@ func (b *Bridge) replyTo(m *telegram.Message, text string) {
 	}
 }
 
-// handlePrivate — сообщения в личке бота: только согласования заявок.
-// Команды "$" выполняются исключительно из личных сообщений mesh (LoRa).
-func (b *Bridge) handlePrivate(m *telegram.Message) {
-	if strings.TrimSpace(m.Text) == "" {
-		return
-	}
-	b.tryApproval(m)
-}
-
 // tryApproval обрабатывает ответ на заявку «Разрешить контакту ...»; true —
 // сообщение было ответом на заявку (и уже обработано).
 func (b *Bridge) tryApproval(m *telegram.Message) bool {
@@ -1033,7 +1009,7 @@ func (b *Bridge) tryApproval(m *telegram.Message) bool {
 		return false
 	}
 	if b.adminID != 0 && m.From.ID != b.adminID {
-		return true // чужой ответ на заявку — игнорируем
+		return true // ответ не от админа — игнорируем
 	}
 	b.decideApproval(m, prefix)
 	return true
