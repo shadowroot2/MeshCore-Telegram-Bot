@@ -53,7 +53,6 @@ type Telegram interface {
 	SendMessage(text string, threadID int64) (int64, error)
 	ReplyToMessage(threadID, replyToMsgID int64, text string) error
 	PostInChat(chatID, threadID, replyTo int64, text string) (int64, error)
-	IsGroupMember(userID int64) (bool, error)
 	CreateForumTopic(name string) (int64, error)
 	EditForumTopic(threadID int64, name string) error
 	GetForumTopic(threadID int64) (string, error)
@@ -1006,36 +1005,13 @@ func (b *Bridge) replyTo(m *telegram.Message, text string) {
 	}
 }
 
-// canCommand — имеет ли пользователь право на команды "$" в личке.
-func (b *Bridge) canCommand(userID int64) bool {
-	if b.adminID != 0 {
-		return userID == b.adminID
-	}
-	ok, err := b.tg.IsGroupMember(userID)
-	if err != nil {
-		log.Printf("admin: проверка участия: %v", err)
-		return false
-	}
-	return ok
-}
-
-// handlePrivate — сообщения в личке бота: команды "$" и согласования.
+// handlePrivate — сообщения в личке бота: только согласования заявок.
+// Команды "$" выполняются исключительно из личных сообщений mesh (LoRa).
 func (b *Bridge) handlePrivate(m *telegram.Message) {
-	body := strings.TrimSpace(m.Text)
-	if body == "" {
+	if strings.TrimSpace(m.Text) == "" {
 		return
 	}
-	if b.tryApproval(m) {
-		return
-	}
-	if cmd := cliFrom(body); cmd != "" {
-		if !b.canCommand(m.From.ID) {
-			b.replyTo(m, "❌ нет доступа к командам")
-			return
-		}
-		b.replyTo(m, b.execCLI(cmd))
-	}
-	// обычный текст в личке — игнорируем
+	b.tryApproval(m)
 }
 
 // tryApproval обрабатывает ответ на заявку «Разрешить контакту ...»; true —

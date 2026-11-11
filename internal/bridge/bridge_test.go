@@ -1136,42 +1136,18 @@ func privUpdate(id int64, text string) telegram.Update {
 	}}
 }
 
-func TestPrivateCLICommand(t *testing.T) {
+func TestPrivateChatIgnoresDollar(t *testing.T) {
+	// команды "$" приходят только из LoRa-ЛС; в личке бота они не выполняются
 	r := &stubRadio{reply: "> 1.0"}
-	tg := &stubTG{members: map[int64]bool{42: true}}
-	b := newTestBridge(t, tg, r) // ADMIN_ID не задан — доступ по членству в группе
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
 
 	processUpdates(b, 0, []telegram.Update{privUpdate(42, "$ ver")})
-	if r.cliCount() != 1 {
-		t.Fatalf("member must run CLI, calls=%d", r.cliCount())
+	if r.cliCount() != 0 {
+		t.Fatalf("private chat must not run CLI, calls=%d", r.cliCount())
 	}
-	sent, _, _ := tg.log()
-	if len(sent) != 1 || sent[0].text != "> 1.0" || sent[0].replyTo != 42 {
-		t.Fatalf("quoted result in private chat: %v", sent)
-	}
-
-	// не участник группы — отказ
-	r2 := &stubRadio{reply: "> x"}
-	tg2 := &stubTG{members: map[int64]bool{}}
-	b2 := newTestBridge(t, tg2, r2)
-	processUpdates(b2, 0, []telegram.Update{privUpdate(7, "$ ver")})
-	if r2.cliCount() != 0 {
-		t.Fatalf("non-member must not run CLI")
-	}
-	sent2, _, _ := tg2.log()
-	if len(sent2) != 1 || !strings.Contains(sent2[0].text, "нет доступа") {
-		t.Fatalf("non-member must be refused: %v", sent2)
-	}
-
-	// ADMIN_ID задан — только он
-	r3 := &stubRadio{reply: "> x"}
-	tg3 := &stubTG{members: map[int64]bool{7: true}}
-	b3 := newTestBridge(t, tg3, r3)
-	b3.adminID = 77
-	processUpdates(b3, 0, []telegram.Update{privUpdate(7, "$ ver")})
-	processUpdates(b3, 0, []telegram.Update{privUpdate(77, "$ ver")})
-	if r3.cliCount() != 1 {
-		t.Fatalf("only ADMIN_ID may run CLI, calls=%d", r3.cliCount())
+	if sent, _, _ := tg.log(); len(sent) != 0 {
+		t.Fatalf("no output expected for $ in private chat: %v", sent)
 	}
 }
 
