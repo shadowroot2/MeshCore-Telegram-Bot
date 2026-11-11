@@ -25,7 +25,6 @@ internal/telegram/           клиент Telegram Bot API
 internal/companion/          companion-протокол радио (TCP, бинарные фреймы)
 internal/bridge/             связка сторон: доставка, форматы, счётчик репиттеров
 docker/                      Dockerfile и docker-compose
-.github/workflows/          CI (vet/test/build) и release (push на Docker Hub)
 ```
 
 ## Требования

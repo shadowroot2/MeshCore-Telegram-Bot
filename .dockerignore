@@ -2,7 +2,6 @@
 .env
 
 .git
-.github
 .gitignore
 README.md
 CLAUDE.md
