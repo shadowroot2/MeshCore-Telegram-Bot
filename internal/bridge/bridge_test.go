@@ -258,8 +258,8 @@ func TestDeliverRoutesToTopics(t *testing.T) {
 	if !strings.Contains(sent[0].text, "SNR 8.5 dB") {
 		t.Fatalf("mesh formatting lost: %q", sent[0].text)
 	}
-	if !strings.Contains(sent[1].text, "[Валера] личка") {
-		t.Fatalf("DM must carry the contact name: %q", sent[1].text)
+	if strings.Contains(sent[1].text, "[") || !strings.Contains(sent[1].text, "личка") {
+		t.Fatalf("DM must have no name tag: %q", sent[1].text)
 	}
 	want := map[string]bool{"Public": true, "Валера": true}
 	for _, name := range created {
@@ -412,31 +412,31 @@ func TestHeardCountGarbageReply(t *testing.T) {
 func TestFormatForTelegram(t *testing.T) {
 	m := msg("привет из меша", 1700000000, 8.5, true)
 	want := time.Unix(1700000000, 0).Format("15:04") + " · SNR 8.5 dB\nпривет из меша"
-	if got := formatForTelegram(m, "", time.Local); got != want {
+	if got := formatForTelegram(m, time.Local); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 
 	// wire-префикс "Имя: " превращается в "[Имя]"
 	m2 := msg("ShadoW: И тебе привет", 0, 0, false)
-	if got := formatForTelegram(m2, "", time.Local); got != "[ShadoW] И тебе привет" {
-		t.Fatalf("got %q", got)
+	if got := formatForTelegram(m2, time.Local); got != "[ShadoW] И тебе привет" {
+		t.Fatalf("channel tag: %q", got)
 	}
 
 	// DM: имя контакта подставляется, т.к. в тексте его нет
 	m3 := msg("личка", 1700000000, 0, false)
-	want3 := time.Unix(1700000000, 0).Format("15:04") + "\n[Валера] личка"
-	if got := formatForTelegram(m3, "Валера", time.Local); got != want3 {
+	want3 := time.Unix(1700000000, 0).Format("15:04") + "\nличка"
+	if got := formatForTelegram(m3, time.Local); got != want3 {
 		t.Fatalf("got %q, want %q", got, want3)
 	}
 
 	m4 := msg("без часов", 0, 8.5, true)
-	if got := formatForTelegram(m4, "", time.Local); got != "SNR 8.5 dB\nбез часов" {
+	if got := formatForTelegram(m4, time.Local); got != "SNR 8.5 dB\nбез часов" {
 		t.Fatalf("got %q", got)
 	}
 
 	// маркеры зеркал (джойстик/автоматика) вычищаются
 	m5 := msg("(>>✓) ShadoW: test", 0, 0, false)
-	if got := formatForTelegram(m5, "", time.Local); got != "[ShadoW] test" {
+	if got := formatForTelegram(m5, time.Local); got != "[ShadoW] test" {
 		t.Fatalf("mirror marker: %q", got)
 	}
 }
@@ -801,9 +801,9 @@ func TestRetryReusesTimestamp(t *testing.T) {
 func TestFormatForTelegramUsesRadioTZ(t *testing.T) {
 	// 1700000000 = 2023-11-14 22:13:20 UTC; на UTC+5 это 03:13
 	loc := time.FixedZone("UTC+5", 5*3600)
-	want := "03:13\n[Имя] Да"
+	want := "03:13\nДа"
 	got := formatForTelegram(companion.Message{Kind: companion.KindDM,
-		Text: "Да", Time: 1700000000}, "Имя", loc)
+		Text: "Да", Time: 1700000000}, loc)
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -835,8 +835,8 @@ func TestDMNameResolvedFromContacts(t *testing.T) {
 	if len(created) != 1 || created[0] != "Валера" {
 		t.Fatalf("topic must be named by the contact: %v", created)
 	}
-	if !strings.Contains(sent[0].text, "[Валера]") {
-		t.Fatalf("tag must carry the contact name: %q", sent[0].text)
+	if strings.Contains(sent[0].text, "[Валера]") {
+		t.Fatalf("DM must not carry the name tag: %q", sent[0].text)
 	}
 	if r.contactsCalls == 0 {
 		t.Fatal("contact list must be re-read for an unknown sender")
@@ -864,8 +864,8 @@ func TestDMTopicRenamedWhenNameKnown(t *testing.T) {
 	if len(created) != 0 {
 		t.Fatalf("no new topics expected: %v", created)
 	}
-	if len(sent) != 1 || !strings.Contains(sent[0].text, "[Валера]") {
-		t.Fatalf("message must use the contact name: %v", sent)
+	if len(sent) != 1 || strings.Contains(sent[0].text, "[Валера]") {
+		t.Fatalf("DM must not carry the name tag: %v", sent)
 	}
 }
 

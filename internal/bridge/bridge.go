@@ -384,11 +384,7 @@ func (b *Bridge) Online() bool {
 func (b *Bridge) Deliver(m companion.Message) error {
 	t := b.targetFor(m)
 	thread := b.topics.ensure(t.key, t.name, b.tg)
-	dmName := ""
-	if m.Kind == companion.KindDM {
-		dmName = t.name
-	}
-	text := formatForTelegram(m, dmName, b.location())
+	text := formatForTelegram(m, b.location())
 	err := b.tg.SendMessage(text, thread)
 	if !isNotFound(err) {
 		return err
@@ -846,19 +842,17 @@ func quotedContact(text string) string {
 }
 
 // formatForTelegram renders the mesh metadata header: "18:37 · SNR 8.5 dB"
-// on its own line above "[Имя] текст". A zero mesh timestamp (no clock on
-// the sending node) is left out rather than shown as epoch. dmName names the
-// contact for DMs, whose wire text carries no sender prefix.
-func formatForTelegram(m companion.Message, dmName string, loc *time.Location) string {
+// on its own line above the text. A zero mesh timestamp (no clock on the
+// sending node) is left out rather than shown as epoch. Канальные сообщения
+// получают тег "[Имя]" (в вкладке несколько отправителей); в личных он не
+// нужен — имя контакта уже в названии вкладки.
+func formatForTelegram(m companion.Message, loc *time.Location) string {
 	// служебные маркеры зеркал (джойстик/автоматика) в TG не показываем
 	text := strings.TrimPrefix(m.Text, "(>>\u2713) ")
 	text = strings.TrimPrefix(text, "(>>\u2717) ")
 	text = strings.TrimPrefix(text, "(>>) ")
 	name, text := splitSender(text)
-	if name == "" {
-		name = dmName
-	}
-	if name != "" {
+	if name != "" && m.Kind != companion.KindDM {
 		text = "[" + name + "] " + text
 	}
 
