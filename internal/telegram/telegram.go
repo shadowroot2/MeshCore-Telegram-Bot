@@ -50,7 +50,8 @@ type ForumTopicEvent struct {
 }
 
 type Chat struct {
-	ID int64 `json:"id"`
+	ID   int64  `json:"id"`
+	Type string `json:"type"` // "private", "group", "supergroup"
 }
 
 type From struct {
@@ -61,16 +62,18 @@ type From struct {
 	Username  string `json:"username"`
 }
 
-// SendMessage posts text into the chat; threadID > 0 routes it into a forum
-// topic (вкладка), 0 is the General topic. Returns the message id so the
-// caller can quote the message later.
-func (c *Client) SendMessage(text string, threadID int64) (int64, error) {
+// PostInChat отправляет текст в любой чат (chatID) с опциональной вкладкой
+// и цитированием; возвращает id сообщения.
+func (c *Client) PostInChat(chatID, threadID, replyTo int64, text string) (int64, error) {
 	v := url.Values{
-		"chat_id": {strconv.FormatInt(c.chatID, 10)},
+		"chat_id": {strconv.FormatInt(chatID, 10)},
 		"text":    {text},
 	}
 	if threadID > 0 {
 		v.Set("message_thread_id", strconv.FormatInt(threadID, 10))
+	}
+	if replyTo > 0 {
+		v.Set("reply_to_message_id", strconv.FormatInt(replyTo, 10))
 	}
 	var res struct {
 		MessageID int64 `json:"message_id"`
@@ -81,16 +84,31 @@ func (c *Client) SendMessage(text string, threadID int64) (int64, error) {
 	return res.MessageID, nil
 }
 
+// SendMessage posts text into the chat; threadID > 0 routes it into a forum
+// topic (вкладка), 0 is the General topic. Returns the message id so the
+// caller can quote the message later.
+func (c *Client) SendMessage(text string, threadID int64) (int64, error) {
+	return c.PostInChat(c.chatID, threadID, 0, text)
+}
+
 func (c *Client) ReplyToMessage(threadID, replyToMsgID int64, text string) error {
-	v := url.Values{
-		"chat_id":             {strconv.FormatInt(c.chatID, 10)},
-		"reply_to_message_id": {strconv.FormatInt(replyToMsgID, 10)},
-		"text":                {text},
+	_, err := c.PostInChat(c.chatID, threadID, replyToMsgID, text)
+	return err
+}
+
+// IsGroupMember — состоит ли пользователь в группе-мосте.
+func (c *Client) IsGroupMember(userID int64) (bool, error) {
+	var res struct {
+		Status string `json:"status"`
 	}
-	if threadID > 0 {
-		v.Set("message_thread_id", strconv.FormatInt(threadID, 10))
+	err := c.call("getChatMember", url.Values{
+		"chat_id": {strconv.FormatInt(c.chatID, 10)},
+		"user_id": {strconv.FormatInt(userID, 10)},
+	}, &res)
+	if err != nil {
+		return false, err
 	}
-	return c.postMessage(v, nil)
+	return res.Status != "left" && res.Status != "kicked", nil
 }
 
 // CreateForumTopic makes a new вкладка in the forum group and returns its id.

@@ -17,6 +17,7 @@ type Config struct {
 	ChatID      int64
 	TopicsFile  string
 	TzOffset    float64 // часы, для шапок времени в Telegram
+	AdminID     int64   // TG id админа; 0 = любой участник группы
 }
 
 // Load resolves settings with the precedence: defaults < config file <
@@ -70,6 +71,13 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("TZ_OFFSET must be hours (например 5 или 5.5): %w", err)
 		}
 		c.TzOffset = hours
+	}
+	if v := get("ADMIN_ID"); v != "" {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return c, fmt.Errorf("ADMIN_ID must be numeric: %w", err)
+		}
+		c.AdminID = id
 	}
 	target := get("TARGET_CHAT_ID")
 	if target == "" {

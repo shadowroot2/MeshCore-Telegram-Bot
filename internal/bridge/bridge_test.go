@@ -76,6 +76,12 @@ func (s *stubRadio) SetChannel(idx byte, name string, secret [16]byte) error {
 	return nil
 }
 
+func (s *stubRadio) cliCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cliCalls
+}
+
 func (s *stubRadio) Contacts() (map[[6]byte]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -107,8 +113,10 @@ func (s *stubRadio) texts() ([]string, []string) {
 }
 
 type outMsg struct {
-	text   string
-	thread int64
+	text    string
+	thread  int64
+	chat    int64
+	replyTo int64
 }
 
 type outReply struct {
@@ -120,18 +128,20 @@ type outReply struct {
 // stubTG implements the Telegram interface, recording outgoing traffic and
 // minting topic ids on createForumTopic.
 type stubTG struct {
-	mu          sync.Mutex
-	sent        []outMsg
-	replies     []outReply
-	created     []string
-	nextID      int64
-	topicFailN  int // fail this many CreateForumTopic calls first
-	threadNames map[int64]string
-	renames     []string
-	listed      map[string]int64 // имя вкладки -> thread id для ListForumTopics
-	sendFailN   int              // столько SendMessage подряд упадут с "not found"
-	editErr     error
-	msgIDs      []int64 // id отправленных сообщений
+	mu           sync.Mutex
+	sent         []outMsg
+	replies      []outReply
+	created      []string
+	nextID       int64
+	topicFailN   int // fail this many CreateForumTopic calls first
+	threadNames  map[int64]string
+	renames      []string
+	listed       map[string]int64 // имя вкладки -> thread id для ListForumTopics
+	sendFailN    int              // столько SendMessage подряд упадут с "not found"
+	editErr      error
+	msgIDs       []int64        // id отправленных сообщений
+	members      map[int64]bool // кто состоит в группе
+	memberChecks []int64
 }
 
 func (s *stubTG) ChatID() int64 { return -100500 }
@@ -139,15 +149,26 @@ func (s *stubTG) ChatID() int64 { return -100500 }
 func (s *stubTG) GetUpdates(offset int64) ([]telegram.Update, error) { return nil, nil }
 
 func (s *stubTG) SendMessage(text string, threadID int64) (int64, error) {
+	return s.PostInChat(s.ChatID(), threadID, 0, text)
+}
+
+func (s *stubTG) PostInChat(chatID, threadID, replyTo int64, text string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sendFailN > 0 {
 		s.sendFailN--
 		return 0, errors.New("Bad Request: message thread not found")
 	}
-	s.sent = append(s.sent, outMsg{text, threadID})
+	s.sent = append(s.sent, outMsg{text, threadID, chatID, replyTo})
 	s.msgIDs = append(s.msgIDs, int64(1000+len(s.sent)))
 	return int64(1000 + len(s.sent)), nil
+}
+
+func (s *stubTG) IsGroupMember(userID int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.memberChecks = append(s.memberChecks, userID)
+	return s.members[userID], nil
 }
 
 func (s *stubTG) ReplyToMessage(threadID, replyToMsgID int64, text string) error {
@@ -216,7 +237,7 @@ func (s *stubTG) log() ([]outMsg, []outReply, []string) {
 
 func newTestBridge(t *testing.T, tg *stubTG, r *stubRadio) *Bridge {
 	t.Helper()
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5, 0)
 	b.r = r
 	b.info = companion.SessionInfo{
 		Channels:   map[byte]string{0: "Public", 1: "Other"},
@@ -233,13 +254,13 @@ func newTestBridge(t *testing.T, tg *stubTG, r *stubRadio) *Bridge {
 func TestTopicsPersistAcrossReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "topics.json")
 	tg := &stubTG{}
-	t1 := New(tg, path, 5)
+	t1 := New(tg, path, 5, 0)
 	id := t1.topics.ensure("ch:0", "Public", tg)
 	if id == 0 {
 		t.Fatal("topic id must be minted")
 	}
 
-	t2 := New(tg, path, 5)
+	t2 := New(tg, path, 5, 0)
 	if got, ok := t2.topics.thread("ch:0"); !ok || got != id {
 		t.Fatalf("reloaded mapping wrong: %d %v", got, ok)
 	}
@@ -306,7 +327,7 @@ func TestDeliverResolvesUnknownChannel(t *testing.T) {
 
 func TestTopicsEnsureRetries(t *testing.T) {
 	tg := &stubTG{topicFailN: 1}
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5, 0)
 	id := b.topics.ensure("ch:0", "Public", tg)
 	if id == 0 {
 		t.Fatal("ensure must retry a failed creation")
@@ -380,7 +401,7 @@ func TestProcessUpdatesRoutesByTopic(t *testing.T) {
 
 func TestProcessUpdatesKeepsOffsetWhenRadioDown(t *testing.T) {
 	tg := &stubTG{}
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5) // no session
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5, 0) // no session
 
 	updates := []telegram.Update{
 		{UpdateID: 1, Message: &telegram.Message{MessageID: 11, Text: "привет",
@@ -824,7 +845,7 @@ func TestFormatForTelegramUsesRadioTZ(t *testing.T) {
 }
 
 func TestLocationFromConfig(t *testing.T) {
-	b := New(&stubTG{}, filepath.Join(t.TempDir(), "topics.json"), 5.5)
+	b := New(&stubTG{}, filepath.Join(t.TempDir(), "topics.json"), 5.5, 0)
 	_, off := time.Unix(0, 0).In(b.location()).Zone()
 	if off != 5*3600+30*60 {
 		t.Fatalf("offset = %d, want 5.5h", off)
@@ -909,7 +930,7 @@ func TestDeliverRecreatesDeletedTopic(t *testing.T) {
 
 func TestEnsureRecreatesWhenRenameFindsDeleted(t *testing.T) {
 	tg := &stubTG{editErr: errors.New("Bad Request: message thread not found")}
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5, 0)
 	b.topics.bind("dm:aabbccdd", 55, "dm-aabb")
 
 	id := b.topics.ensure("dm:aabbccdd", "Валера", tg)
@@ -988,7 +1009,7 @@ func TestAnnounceRetriesAfterFailure(t *testing.T) {
 
 func TestEnsureKeepsUserRenamedTopic(t *testing.T) {
 	tg := &stubTG{}
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5, 0)
 	// вкладку назвали вручную — бот не должен перетирать имя
 	b.topics.bind("ch:0", 10, "Мой друг")
 
@@ -1007,7 +1028,7 @@ func TestEnsureKeepsUserRenamedTopic(t *testing.T) {
 
 func TestBindExistingFollowsUserRename(t *testing.T) {
 	tg := &stubTG{listed: map[string]int64{"Мой друг": 10}}
-	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5)
+	b := New(tg, filepath.Join(t.TempDir(), "topics.json"), 5, 0)
 	b.info = companion.SessionInfo{Channels: map[byte]string{0: "Public"},
 		Contacts: map[[6]byte]string{}, DefaultIdx: 0}
 	// наш маппинг: вкладка 10 раньше называлась Public
@@ -1032,6 +1053,7 @@ func TestLoRaCLICommandRunsAndReplies(t *testing.T) {
 	tg := &stubTG{}
 	b := newTestBridge(t, tg, r)
 	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b.admins.set(prefix, "allow") // уже согласован
 
 	dm := companion.Message{Kind: companion.KindDM, Prefix: prefix,
 		Text: "$ ver", Time: 1}
@@ -1076,7 +1098,213 @@ func TestPlainDMNotExecuted(t *testing.T) {
 	if err := b.Deliver(dm); err != nil {
 		t.Fatal(err)
 	}
-	if r.cliCalls != 0 {
-		t.Fatalf("plain DM must not run CLI, calls=%d", r.cliCalls)
+	if r.cliCount() != 0 {
+		t.Fatalf("plain DM must not run CLI, calls=%d", r.cliCount())
 	}
+}
+
+func TestGroupDollarGoesToMesh(t *testing.T) {
+	// "$" в группе (в т.ч. во вкладке ЛС) — обычный текст, не команда
+	r := &stubRadio{}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.topics.bind("ch:0", 10, "Public")
+
+	updates := []telegram.Update{
+		{UpdateID: 1, Message: &telegram.Message{MessageID: 11, Text: "$ ver",
+			MessageThreadID: 10, IsTopicMessage: true,
+			Chat: telegram.Chat{ID: -100500, Type: "supergroup"},
+			From: telegram.From{ID: 1, FirstName: "А"}}},
+	}
+	if next := processUpdates(b, 0, updates); next != 2 {
+		t.Fatalf("offset = %d", next)
+	}
+	if r.cliCount() != 0 {
+		t.Fatalf("group $ must not run CLI, calls=%d", r.cliCount())
+	}
+	ch, _ := r.texts()
+	if len(ch) != 1 || ch[0] != "$ ver" {
+		t.Fatalf("group $ must go to mesh as text: %v", ch)
+	}
+}
+
+func privUpdate(id int64, text string) telegram.Update {
+	return telegram.Update{UpdateID: id, Message: &telegram.Message{
+		MessageID: id, Text: text,
+		Chat: telegram.Chat{ID: id, Type: "private"},
+		From: telegram.From{ID: id, FirstName: "Ю"},
+	}}
+}
+
+func TestPrivateCLICommand(t *testing.T) {
+	r := &stubRadio{reply: "> 1.0"}
+	tg := &stubTG{members: map[int64]bool{42: true}}
+	b := newTestBridge(t, tg, r) // ADMIN_ID не задан — доступ по членству в группе
+
+	processUpdates(b, 0, []telegram.Update{privUpdate(42, "$ ver")})
+	if r.cliCount() != 1 {
+		t.Fatalf("member must run CLI, calls=%d", r.cliCount())
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || sent[0].text != "> 1.0" || sent[0].replyTo != 42 {
+		t.Fatalf("quoted result in private chat: %v", sent)
+	}
+
+	// не участник группы — отказ
+	r2 := &stubRadio{reply: "> x"}
+	tg2 := &stubTG{members: map[int64]bool{}}
+	b2 := newTestBridge(t, tg2, r2)
+	processUpdates(b2, 0, []telegram.Update{privUpdate(7, "$ ver")})
+	if r2.cliCount() != 0 {
+		t.Fatalf("non-member must not run CLI")
+	}
+	sent2, _, _ := tg2.log()
+	if len(sent2) != 1 || !strings.Contains(sent2[0].text, "нет доступа") {
+		t.Fatalf("non-member must be refused: %v", sent2)
+	}
+
+	// ADMIN_ID задан — только он
+	r3 := &stubRadio{reply: "> x"}
+	tg3 := &stubTG{members: map[int64]bool{7: true}}
+	b3 := newTestBridge(t, tg3, r3)
+	b3.adminID = 77
+	processUpdates(b3, 0, []telegram.Update{privUpdate(7, "$ ver")})
+	processUpdates(b3, 0, []telegram.Update{privUpdate(77, "$ ver")})
+	if r3.cliCount() != 1 {
+		t.Fatalf("only ADMIN_ID may run CLI, calls=%d", r3.cliCount())
+	}
+}
+
+func TestLoRaApprovalFlow(t *testing.T) {
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{reply: "> 1.2.3", chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.adminID = 500 // заявки уходят в личку админа
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+
+	dm := companion.Message{Kind: companion.KindDM, Prefix: prefix, Text: "$ ver", Time: 1}
+	if err := b.Deliver(dm); err != nil {
+		t.Fatal(err)
+	}
+
+	sent, _, _ := tg.log()
+	if len(sent) != 2 {
+		t.Fatalf("forwarded + prompt expected, got %v", sent)
+	}
+	prompt := sent[1]
+	if prompt.chat != 500 || !strings.Contains(prompt.text, "Разрешить контакту Валера deadbeef0001") {
+		t.Fatalf("prompt to admin private chat: %v", prompt)
+	}
+	if r.cliCount() != 0 {
+		t.Fatal("command must wait for approval")
+	}
+
+	// админ отвечает «да» на заявку
+	reply := &telegram.Message{MessageID: 9, Text: "да",
+		Chat:           telegram.Chat{ID: 500, Type: "private"},
+		From:           telegram.From{ID: 500},
+		ReplyToMessage: &telegram.Message{MessageID: promptID(tg), Text: prompt.text}}
+	processUpdates(b, 0, []telegram.Update{{UpdateID: 1, Message: reply}})
+
+	if r.cliCount() != 1 {
+		t.Fatalf("approved command must run, calls=%d", r.cliCount())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sentNow, reps, _ := tg.log()
+		var saved, result bool
+		for _, o := range sentNow {
+			if strings.Contains(o.text, "сохранен как администратор") {
+				saved = true
+			}
+			if o.text == "> 1.2.3" {
+				result = true
+			}
+		}
+		for _, o := range reps {
+			if o.text == "> 1.2.3" {
+				result = true
+			}
+		}
+		if saved && result {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("saved=%v result=%v sent=%v replies=%v", saved, result, sentNow, reps)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(r.dmTexts()) == 0 {
+		t.Fatal("result must go back to the contact over LoRa")
+	}
+
+	// повторная команда — уже без согласования
+	before := r.cliCount()
+	b.Deliver(companion.Message{Kind: companion.KindDM, Prefix: prefix, Text: "$ ver", Time: 2})
+	deadline = time.Now().Add(2 * time.Second)
+	for r.cliCount() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("approved contact must run commands without a prompt")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func promptID(tg *stubTG) int64 {
+	ids := tg.ids()
+	if len(ids) == 0 {
+		return 0
+	}
+	return ids[len(ids)-1]
+}
+
+func TestLoRaApprovalDenied(t *testing.T) {
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{reply: "> x", chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.adminID = 500
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+
+	b.Deliver(companion.Message{Kind: companion.KindDM, Prefix: prefix, Text: "$ ver", Time: 1})
+	sent, _, _ := tg.log()
+	prompt := sent[1]
+
+	reply := &telegram.Message{MessageID: 9, Text: "нет",
+		Chat:           telegram.Chat{ID: 500, Type: "private"},
+		From:           telegram.From{ID: 500},
+		ReplyToMessage: &telegram.Message{MessageID: promptID(tg), Text: prompt.text}}
+	processUpdates(b, 0, []telegram.Update{{UpdateID: 1, Message: reply}})
+
+	sentNow, _, _ := tg.log()
+	var denied bool
+	for _, o := range sentNow {
+		if strings.Contains(o.text, "запрещено выполнять команды") {
+			denied = true
+		}
+	}
+	if !denied {
+		t.Fatalf("deny reply missing: %v", sentNow)
+	}
+	if dm := r.dmTexts(); len(dm) != 1 || !strings.Contains(dm[0], "Вам запрещено") {
+		t.Fatalf("LoRa deny: %v", dm)
+	}
+	if r.cliCount() != 0 {
+		t.Fatal("denied command must not run")
+	}
+}
+
+func TestAdminsPersist(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "topics.json")
+	a := loadAdmins(filepath.Join(dir, "admins.json"))
+	prefix := [6]byte{1, 2, 3, 4, 5, 6}
+	a.set(prefix, "allow")
+
+	b := loadAdmins(filepath.Join(dir, "admins.json"))
+	if b.get(prefix) != "allow" {
+		t.Fatalf("admins must survive restart, got %q", b.get(prefix))
+	}
+	_ = path
 }

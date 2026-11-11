@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,8 @@ type Telegram interface {
 	GetUpdates(offset int64) ([]telegram.Update, error)
 	SendMessage(text string, threadID int64) (int64, error)
 	ReplyToMessage(threadID, replyToMsgID int64, text string) error
+	PostInChat(chatID, threadID, replyTo int64, text string) (int64, error)
+	IsGroupMember(userID int64) (bool, error)
 	CreateForumTopic(name string) (int64, error)
 	EditForumTopic(threadID int64, name string) error
 	GetForumTopic(threadID int64) (string, error)
@@ -64,6 +67,60 @@ type target struct {
 	prefix  [6]byte
 	key     string // registry key: "ch:<idx>" or "dm:<prefix hex>"
 	name    string // topic title
+}
+
+// admins — постоянный список контактов, которым разрешены команды из LoRa.
+type admins struct {
+	mu    sync.Mutex
+	path  string
+	state map[string]string // hex префикса -> "allow"/"deny"
+}
+
+func loadAdmins(path string) *admins {
+	a := &admins{path: path, state: map[string]string{}}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return a
+	}
+	if err := json.Unmarshal(data, &a.state); err != nil {
+		log.Printf("admins: %s: %v", path, err)
+		a.state = map[string]string{}
+	}
+	log.Printf("admins: %s: %d записей", path, len(a.state))
+	return a
+}
+
+func (a *admins) get(prefix [6]byte) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.state[fmt.Sprintf("%x", prefix)]
+}
+
+func (a *admins) set(prefix [6]byte, state string) {
+	a.mu.Lock()
+	a.state[fmt.Sprintf("%x", prefix)] = state
+	raw := make(map[string]string, len(a.state))
+	for k, v := range a.state {
+		raw[k] = v
+	}
+	a.mu.Unlock()
+	if data, err := json.Marshal(raw); err == nil {
+		if err := os.WriteFile(a.path, data, 0o600); err != nil {
+			log.Printf("admins: save %s: %v", a.path, err)
+		}
+	}
+}
+
+// pendingApproval — отложенная команда из LoRa, ждущая согласования.
+type pendingApproval struct {
+	cmd          string
+	name         string
+	prefix       [6]byte
+	promptChat   int64
+	promptMsg    int64
+	promptThread int64
+	thread       int64 // вкладка ЛС: куда цитировать результат
+	forwardedID  int64 // id пересланного "$ команда" в группе
 }
 
 // topics maps mesh endpoints to Telegram forum topic ids and persists the
@@ -246,14 +303,26 @@ type Bridge struct {
 
 	tz        *time.Location // пояс из TZ_OFFSET конфига
 	announced bool           // стартовое сообщение уже ушло
+
+	adminID int64
+	admins  *admins
+	pMu     sync.Mutex
+	pending map[string]pendingApproval // hex префикса -> заявка
 }
 
-func New(tg Telegram, topicsFile string, tzHours float64) *Bridge {
+func New(tg Telegram, topicsFile string, tzHours float64, adminID int64) *Bridge {
 	loc := time.Local
 	if tzHours != 0 {
 		loc = time.FixedZone(fmt.Sprintf("UTC%+g", tzHours), int(tzHours*3600))
 	}
-	return &Bridge{tg: tg, topics: loadTopics(topicsFile), tz: loc}
+	return &Bridge{
+		tg:      tg,
+		topics:  loadTopics(topicsFile),
+		admins:  loadAdmins(filepath.Join(filepath.Dir(topicsFile), "admins.json")),
+		tz:      loc,
+		adminID: adminID,
+		pending: map[string]pendingApproval{},
+	}
 }
 
 // Attach implements companion.Hooks: remembers the session and syncs the
@@ -400,7 +469,7 @@ func (b *Bridge) Deliver(m companion.Message) error {
 	// результат вернётся цитатой в TG и DM отправителю
 	if m.Kind == companion.KindDM {
 		if cmd := cliFrom(m.Text); cmd != "" {
-			go b.runMeshCLI(m, cmd, msgID, thread)
+			b.startMeshCLI(m, cmd, msgID, thread)
 		}
 	}
 	return nil
@@ -753,7 +822,17 @@ func PollTelegram(b *Bridge) {
 func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 	for _, u := range updates {
 		m := u.Message
-		if m == nil || m.Chat.ID != b.tg.ChatID() || m.From.IsBot {
+		if m == nil || m.From.IsBot {
+			offset = u.UpdateID + 1
+			continue
+		}
+		// личка бота: команды "$" и согласования
+		if m.Chat.Type == "private" {
+			b.handlePrivate(m)
+			offset = u.UpdateID + 1
+			continue
+		}
+		if m.Chat.ID != b.tg.ChatID() {
 			offset = u.UpdateID + 1
 			continue
 		}
@@ -765,6 +844,11 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 		}
 		body := strings.TrimSpace(m.Text)
 		if body == "" {
+			offset = u.UpdateID + 1
+			continue
+		}
+		// ответ на заявку «Разрешить контакту...» из вкладки ЛС
+		if b.tryApproval(m) {
 			offset = u.UpdateID + 1
 			continue
 		}
@@ -782,16 +866,7 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 				continue
 			}
 		}
-		// "$ команда" в личных сообщениях — CLI радио, а не mesh-текст;
-		// обычные ЛС идут контакту как раньше
-		if tgt.kind == companion.KindDM && strings.HasPrefix(body, "$") {
-			cmd := strings.TrimSpace(strings.TrimPrefix(body, "$"))
-			if cmd != "" {
-				b.runCLICommand(m, cmd)
-			}
-			offset = u.UpdateID + 1
-			continue
-		}
+		// "$" в группах (в т.ч. во вкладках ЛС) — обычный текст для mesh
 		budget := companion.MaxDMText
 		if tgt.kind == companion.KindChannel {
 			budget = companion.MaxChannelText
@@ -833,29 +908,52 @@ func cliResult(out string, err error) string {
 	}
 }
 
-// runMeshCLI выполняет команду из LoRa: результат уходит цитированием в TG
-// (на пересланную команду) и ответным личным сообщением отправителю по LoRa.
-func (b *Bridge) runMeshCLI(m companion.Message, cmd string, replyTo, thread int64) {
-	b.mu.Lock()
-	r := b.r
-	b.mu.Unlock()
-
-	out := ""
-	var err error
-	if r == nil {
-		err = errors.New("радио не подключено")
-	} else {
-		log.Printf("cli: $ %s (из LoRa)", cmd)
-		out, err = r.RunCLI(cmd)
-	}
-	text := cliResult(out, err)
-
+// runMeshCLI выполняет разрешённую команду из LoRa: результат уходит
+// цитированием в TG (на пересланную команду) и DM отправителю по LoRa.
+func (b *Bridge) runMeshCLI(prefix [6]byte, cmd string, forwardedID, thread int64) {
+	text := b.execCLI(cmd)
 	for _, part := range splitText(text, 4000) {
-		if perr := b.tg.ReplyToMessage(thread, replyTo, part); perr != nil {
-			log.Printf("telegram: %v", perr)
+		if err := b.tg.ReplyToMessage(thread, forwardedID, part); err != nil {
+			log.Printf("telegram: %v", err)
 		}
 	}
-	b.sendDM(m.Prefix, text)
+	b.sendDM(prefix, text)
+}
+
+// startMeshCLI — команда "$" из LoRa: сразу выполнить (контакту разрешено),
+// отказать (запрещено) или запросить согласование в личке.
+func (b *Bridge) startMeshCLI(m companion.Message, cmd string, forwardedID, thread int64) {
+	name := b.contactName(m.Prefix)
+	if name == "" {
+		name = "dm-" + fmt.Sprintf("%x", m.Prefix)[:4]
+	}
+	switch b.admins.get(m.Prefix) {
+	case "allow":
+		go b.runMeshCLI(m.Prefix, cmd, forwardedID, thread)
+	case "deny":
+		b.sendDM(m.Prefix, "❌ Вам запрещено выполнять команды")
+	default:
+		chat, pThread := b.promptTarget(thread)
+		id, err := b.tg.PostInChat(chat, pThread, 0, approvalPrompt(name, m.Prefix))
+		if err != nil {
+			log.Printf("telegram: %v", err)
+			return
+		}
+		b.setPending(m.Prefix, pendingApproval{
+			cmd: cmd, name: name, prefix: m.Prefix,
+			promptChat: chat, promptMsg: id, promptThread: pThread,
+			thread: thread, forwardedID: forwardedID,
+		})
+	}
+}
+
+// promptTarget: заявка уходит админу в личку, а если ADMIN_ID не задан —
+// во вкладку ЛС контакта в группе.
+func (b *Bridge) promptTarget(thread int64) (chatID, threadID int64) {
+	if b.adminID != 0 {
+		return b.adminID, 0
+	}
+	return b.tg.ChatID(), thread
 }
 
 // sendDM отвечает отправителю личным сообщением по LoRa.
@@ -882,9 +980,8 @@ func (b *Bridge) nextTs() uint32 {
 	return b.nextTsLocked()
 }
 
-// runCLICommand выполняет команду CLI радио и отвечает цитированием на
-// сообщение с командой.
-func (b *Bridge) runCLICommand(m *telegram.Message, cmd string) {
+// execCLI выполняет команду CLI на радио и возвращает готовый текст ответа.
+func (b *Bridge) execCLI(cmd string) string {
 	b.mu.Lock()
 	r := b.r
 	b.mu.Unlock()
@@ -897,13 +994,140 @@ func (b *Bridge) runCLICommand(m *telegram.Message, cmd string) {
 		log.Printf("cli: $ %s", cmd)
 		out, err = r.RunCLI(cmd)
 	}
-	text := cliResult(out, err)
-	// длинные ответы (gps diag и т.п.) уходят частями, каждый реплаем
+	return cliResult(out, err)
+}
+
+// replyTo отвечает цитированием на сообщение в его чате/вкладке.
+func (b *Bridge) replyTo(m *telegram.Message, text string) {
 	for _, part := range splitText(text, 4000) {
-		if perr := b.tg.ReplyToMessage(m.MessageThreadID, m.MessageID, part); perr != nil {
-			log.Printf("telegram: %v", perr)
+		if _, err := b.tg.PostInChat(m.Chat.ID, m.MessageThreadID, m.MessageID, part); err != nil {
+			log.Printf("telegram: %v", err)
 		}
 	}
+}
+
+// canCommand — имеет ли пользователь право на команды "$" в личке.
+func (b *Bridge) canCommand(userID int64) bool {
+	if b.adminID != 0 {
+		return userID == b.adminID
+	}
+	ok, err := b.tg.IsGroupMember(userID)
+	if err != nil {
+		log.Printf("admin: проверка участия: %v", err)
+		return false
+	}
+	return ok
+}
+
+// handlePrivate — сообщения в личке бота: команды "$" и согласования.
+func (b *Bridge) handlePrivate(m *telegram.Message) {
+	body := strings.TrimSpace(m.Text)
+	if body == "" {
+		return
+	}
+	if b.tryApproval(m) {
+		return
+	}
+	if cmd := cliFrom(body); cmd != "" {
+		if !b.canCommand(m.From.ID) {
+			b.replyTo(m, "❌ нет доступа к командам")
+			return
+		}
+		b.replyTo(m, b.execCLI(cmd))
+	}
+	// обычный текст в личке — игнорируем
+}
+
+// tryApproval обрабатывает ответ на заявку «Разрешить контакту ...»; true —
+// сообщение было ответом на заявку (и уже обработано).
+func (b *Bridge) tryApproval(m *telegram.Message) bool {
+	if m.ReplyToMessage == nil {
+		return false
+	}
+	prefix, ok := promptPrefix(m.ReplyToMessage.Text)
+	if !ok {
+		return false
+	}
+	if b.adminID != 0 && m.From.ID != b.adminID {
+		return true // чужой ответ на заявку — игнорируем
+	}
+	b.decideApproval(m, prefix)
+	return true
+}
+
+// decideApproval — «да»/«yes» сохраняет контакт как админа и выполняет
+// отложенную команду, любой другой ответ запрещает.
+func (b *Bridge) decideApproval(m *telegram.Message, prefix [6]byte) {
+	name := b.contactName(prefix)
+	if name == "" {
+		name = "dm-" + fmt.Sprintf("%x", prefix)[:4]
+	}
+	if ans := strings.ToLower(strings.TrimSpace(m.Text)); ans == "да" || ans == "yes" {
+		b.admins.set(prefix, "allow")
+		b.replyTo(m, fmt.Sprintf("💾 %s сохранен как администратор!", name))
+		if p, ok := b.takePending(prefix); ok {
+			text := b.execCLI(p.cmd)
+			// цитатой на заявку + в ЛС-вкладку + DM отправителю по LoRa
+			if _, err := b.tg.PostInChat(p.promptChat, p.promptThread, p.promptMsg, text); err != nil {
+				log.Printf("telegram: %v", err)
+			}
+			for _, part := range splitText(text, 4000) {
+				if err := b.tg.ReplyToMessage(p.thread, p.forwardedID, part); err != nil {
+					log.Printf("telegram: %v", err)
+				}
+			}
+			b.sendDM(p.prefix, text)
+		}
+		return
+	}
+	b.admins.set(prefix, "deny")
+	b.replyTo(m, fmt.Sprintf("❌ %s запрещено выполнять команды", name))
+	b.sendDM(prefix, "❌ Вам запрещено выполнять команды")
+	b.dropPending(prefix)
+}
+
+func (b *Bridge) setPending(prefix [6]byte, p pendingApproval) {
+	b.pMu.Lock()
+	defer b.pMu.Unlock()
+	b.pending[fmt.Sprintf("%x", prefix)] = p
+}
+
+func (b *Bridge) takePending(prefix [6]byte) (pendingApproval, bool) {
+	b.pMu.Lock()
+	defer b.pMu.Unlock()
+	k := fmt.Sprintf("%x", prefix)
+	p, ok := b.pending[k]
+	delete(b.pending, k)
+	return p, ok
+}
+
+func (b *Bridge) dropPending(prefix [6]byte) {
+	b.pMu.Lock()
+	defer b.pMu.Unlock()
+	delete(b.pending, fmt.Sprintf("%x", prefix))
+}
+
+// approvalPrompt — заявка на разрешение команд от контакта.
+func approvalPrompt(name string, prefix [6]byte) string {
+	return fmt.Sprintf("🔑 Разрешить контакту %s %x выполнять команды?", name, prefix)
+}
+
+// promptPrefix вытаскивает хэш контакта из текста заявки.
+func promptPrefix(text string) ([6]byte, bool) {
+	var prefix [6]byte
+	if !strings.Contains(text, "Разрешить контакту") {
+		return prefix, false
+	}
+	fields := strings.Fields(text)
+	if len(fields) < 5 {
+		return prefix, false
+	}
+	raw, err := hex.DecodeString(fields[len(fields)-3])
+	if err != nil || len(raw) != len(prefix) {
+		return prefix, false
+	}
+	copy(prefix[:], raw)
+	return prefix, true
 }
 
 // checkHeard replies to the user's message with how many repeaters repeated
