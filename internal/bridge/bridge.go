@@ -25,6 +25,10 @@ import (
 // tests can shorten it.
 var heardCheckDelay = 5 * time.Second
 
+// remoteCLITimeout — сколько ждать ответа удалённой командной строки. Var
+// для тестов.
+var remoteCLITimeout = 60 * time.Second
+
 const (
 	maxNameLen      = 32 // sender name budget before it eats the mesh text
 	maxChannelSlots = 8  // group channel slots on the radio
@@ -39,6 +43,7 @@ const (
 type radio interface {
 	SendChannelText(idx byte, text string, ts uint32) error
 	SendContactText(prefix [6]byte, text string, ts uint32) error
+	SendContactCommand(prefix [6]byte, text string, ts uint32) error
 	QueryChannel(idx byte) (string, [16]byte, error)
 	SetChannel(idx byte, name string, secret [16]byte) error
 	Contacts() (map[[6]byte]string, error)
@@ -123,6 +128,28 @@ type pendingApproval struct {
 	promptThread int64
 	thread       int64 // вкладка ЛС: куда цитировать результат
 	forwardedID  int64 // id пересланного "$ команда" в группе
+}
+
+// remoteGate — $$ команда, ждущая подтверждения оператором, что на узле
+// контакта выдан допуск «командная строка». До подтверждения в LoRa ничего
+// не уходит: без допуска прошивка показала бы текст команды владельцу узла.
+type remoteGate struct {
+	cmd    string
+	prefix [6]byte
+	name   string
+	chatID int64
+	thread int64
+	origin int64 // id исходного "$$ команда" — цитировать результат
+}
+
+// remoteInflight — $$ команда в полёте; ответ придёт CLI_DATA с префиксом
+// cmdID (его отражает прошивка целевого узла).
+type remoteInflight struct {
+	prefix [6]byte
+	chatID int64
+	thread int64
+	origin int64
+	timer  *time.Timer
 }
 
 // topics maps mesh endpoints to Telegram forum topic ids and persists the
@@ -306,9 +333,15 @@ type Bridge struct {
 	announced bool           // стартовое сообщение уже ушло
 
 	adminID int64
-	admins  *admins
+	admins  *admins // контакты, которым разрешены команды из LoRa
+	remote  *admins // remote.json: оператор подтвердил допуск «командная строка»
 	pMu     sync.Mutex
 	pending map[string]pendingApproval // hex префикса -> заявка
+
+	gMu      sync.Mutex
+	gates    map[int64]remoteGate      // id заявки допуска -> $$ команда
+	inflight map[string]remoteInflight // cmdID -> команда в полёте
+	cmdSeq   byte                      // счётчик префиксов корреляции $$
 }
 
 func New(tg Telegram, topicsFile string, tzHours float64, adminID int64) *Bridge {
@@ -316,12 +349,15 @@ func New(tg Telegram, topicsFile string, tzHours float64, adminID int64) *Bridge
 	// явный сдвиг (по умолчанию +5)
 	loc := time.FixedZone(fmt.Sprintf("UTC%+g", tzHours), int(tzHours*3600))
 	return &Bridge{
-		tg:      tg,
-		topics:  loadTopics(topicsFile),
-		admins:  loadAdmins(filepath.Join(filepath.Dir(topicsFile), "admins.json")),
-		tz:      loc,
-		adminID: adminID,
-		pending: map[string]pendingApproval{},
+		tg:       tg,
+		topics:   loadTopics(topicsFile),
+		admins:   loadAdmins(filepath.Join(filepath.Dir(topicsFile), "admins.json")),
+		remote:   loadAdmins(filepath.Join(filepath.Dir(topicsFile), "remote.json")),
+		tz:       loc,
+		adminID:  adminID,
+		pending:  map[string]pendingApproval{},
+		gates:    map[int64]remoteGate{},
+		inflight: map[string]remoteInflight{},
 	}
 }
 
@@ -455,6 +491,10 @@ func (b *Bridge) Online() bool {
 
 // Deliver routes a mesh message into its Telegram topic.
 func (b *Bridge) Deliver(m companion.Message) error {
+	// ответ удалённой командной строки ($$) — цитата на исходную команду
+	if b.completeRemote(m) {
+		return nil
+	}
 	t := b.targetFor(m)
 	thread := b.topics.ensure(t.key, t.name, b.tg)
 	text := formatForTelegram(m, b.location())
@@ -479,13 +519,39 @@ func (b *Bridge) Deliver(m companion.Message) error {
 	return nil
 }
 
-// cliFrom вырезает команду из текста с префиксом "$ ".
+// cliFrom вырезает локальную команду "$ ver" (CLI радио, к которому подключён
+// бот). "$$" — удалённая команда, "$5" — текст: командой считается только
+// "$"+буква, сырой текст команд в LoRa не попадает.
 func cliFrom(text string) string {
 	t := strings.TrimSpace(text)
-	if !strings.HasPrefix(t, "$") {
+	if !strings.HasPrefix(t, "$") || strings.HasPrefix(t, "$$") {
 		return ""
 	}
-	return strings.TrimSpace(strings.TrimPrefix(t, "$"))
+	return commandBody(strings.TrimPrefix(t, "$"))
+}
+
+// dcliFrom вырезает удалённую команду "$$ ver" — командную строку узла
+// контакта (работает только во вкладках ЛС).
+func dcliFrom(text string) string {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "$$") {
+		return ""
+	}
+	return commandBody(strings.TrimPrefix(t, "$$"))
+}
+
+// commandBody: пустое и «$5» командами не считаются — команда начинается
+// с буквы.
+func commandBody(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	c := s[0]
+	if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+		return s
+	}
+	return ""
 }
 
 // contactName возвращает имя контакта; для неизвестного/безымянного префикса
@@ -838,9 +904,12 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 			offset = u.UpdateID + 1
 			continue
 		}
-		// личка бота (любой): команды "$"
+		// личка бота (любой): "$" — локальный CLI; "$$" работает только
+		// во вкладках ЛС (там есть контакт-цель)
 		if m.Chat.Type == "private" {
-			if cmd := cliFrom(strings.TrimSpace(m.Text)); cmd != "" {
+			if dcliFrom(strings.TrimSpace(m.Text)) != "" {
+				b.replyTo(m, "❌ команды $$ доступны только в личных сообщениях")
+			} else if cmd := cliFrom(strings.TrimSpace(m.Text)); cmd != "" {
 				if !b.canCommand(m.From.ID) {
 					b.replyTo(m, "❌ нет доступа к командам")
 				} else {
@@ -865,8 +934,26 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 			offset = u.UpdateID + 1
 			continue
 		}
-		// ответ на заявку «Разрешить контакту...» из вкладки ЛС
-		if b.tryApproval(m) {
+		// ответ на заявку «Разрешить контакту...» из вкладки ЛС или на
+		// подтверждение допуска «командная строка» для $$
+		if b.tryApproval(m) || b.tryRemoteGate(m) {
+			offset = u.UpdateID + 1
+			continue
+		}
+		// "$$" — удалённая командная строка узла контакта (только вкладка ЛС);
+		// "$" — локальный CLI радио в любой теме. Сырой текст команд в LoRa
+		// не уходит никогда
+		if cmd := dcliFrom(body); cmd != "" {
+			b.startRemoteCLI(m, cmd)
+			offset = u.UpdateID + 1
+			continue
+		}
+		if cmd := cliFrom(body); cmd != "" {
+			if !b.canCommand(m.From.ID) {
+				b.replyTo(m, "❌ нет доступа к командам")
+			} else {
+				b.replyTo(m, b.execCLI(cmd))
+			}
 			offset = u.UpdateID + 1
 			continue
 		}
@@ -883,17 +970,6 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 				offset = u.UpdateID + 1
 				continue
 			}
-		}
-		// "$ команда" в личных чатах (вкладка ЛС) — CLI радио, в LoRa ничего
-		// не уходит; в канале — обычный текст для mesh
-		if cmd := cliFrom(body); cmd != "" && tgt.kind == companion.KindDM {
-			if !b.canCommand(m.From.ID) {
-				b.replyTo(m, "❌ нет доступа к командам")
-			} else {
-				b.replyTo(m, b.execCLI(cmd))
-			}
-			offset = u.UpdateID + 1
-			continue
 		}
 		budget := companion.MaxDMText
 		if tgt.kind == companion.KindChannel {
@@ -1114,6 +1190,175 @@ func (b *Bridge) dropPending(prefix [6]byte) {
 	b.pMu.Lock()
 	defer b.pMu.Unlock()
 	delete(b.pending, fmt.Sprintf("%x", prefix))
+}
+
+// dmOfThread — какой контакт стоит за вкладкой; создает ничего не надо.
+func (b *Bridge) dmOfThread(thread int64) ([6]byte, bool) {
+	var prefix [6]byte
+	if thread <= 0 {
+		return prefix, false
+	}
+	key, ok := b.topics.key(thread)
+	if !ok {
+		return prefix, false
+	}
+	kind, arg, ok := strings.Cut(key, ":")
+	if !ok || kind != "dm" {
+		return prefix, false
+	}
+	raw, err := hex.DecodeString(arg)
+	if err != nil || len(raw) != len(prefix) {
+		return prefix, false
+	}
+	copy(prefix[:], raw)
+	return prefix, true
+}
+
+// startRemoteCLI — "$$" из вкладки ЛС: удалённая командная строка узла
+// контакта. Пока оператор не подтвердил допуск на целевом узле, в LoRa не
+// уходит ничего: без допуска прошивка показала бы текст команды владельцу.
+func (b *Bridge) startRemoteCLI(m *telegram.Message, cmd string) {
+	prefix, ok := b.dmOfThread(m.MessageThreadID)
+	if !ok {
+		b.replyTo(m, "❌ команды $$ доступны только в личных сообщениях")
+		return
+	}
+	if b.adminID == 0 || m.From.ID != b.adminID {
+		b.replyTo(m, "❌ нет доступа к командам")
+		return
+	}
+	name := b.contactName(prefix)
+	if name == "" {
+		name = "dm-" + fmt.Sprintf("%x", prefix)[:4]
+	}
+	if b.remote.get(prefix) == "allow" {
+		b.sendRemoteCLI(prefix, cmd, m.Chat.ID, m.MessageThreadID, m.MessageID)
+		return
+	}
+	id, err := b.tg.PostInChat(m.Chat.ID, m.MessageThreadID, 0, remoteGatePrompt(name))
+	if err != nil {
+		log.Printf("telegram: заявка не ушла: %v", err)
+		return
+	}
+	b.gMu.Lock()
+	b.gates[id] = remoteGate{cmd: cmd, prefix: prefix, name: name,
+		chatID: m.Chat.ID, thread: m.MessageThreadID, origin: m.MessageID}
+	b.gMu.Unlock()
+	log.Printf("cli: $$ %s от %s ждёт подтверждения допуска", cmd, name)
+}
+
+// remoteGatePrompt — заявка на подтверждение допуска «командная строка».
+func remoteGatePrompt(name string) string {
+	return fmt.Sprintf("🔑 Подтверди, что на узле «%s» выдан допуск «командная строка»?", name)
+}
+
+// tryRemoteGate обрабатывает ответ на заявку допуска $$; true — сообщение было
+// ответом на заявку (и уже обработано). Решает только оператор (ADMIN_ID).
+func (b *Bridge) tryRemoteGate(m *telegram.Message) bool {
+	if m.ReplyToMessage == nil {
+		return false
+	}
+	b.gMu.Lock()
+	_, ok := b.gates[m.ReplyToMessage.MessageID]
+	b.gMu.Unlock()
+	if !ok {
+		return false
+	}
+	if b.adminID == 0 || m.From.ID != b.adminID {
+		return true // не оператор — игнорируем
+	}
+	b.gMu.Lock()
+	g, ok := b.gates[m.ReplyToMessage.MessageID]
+	delete(b.gates, m.ReplyToMessage.MessageID)
+	b.gMu.Unlock()
+	if !ok {
+		return true
+	}
+	if ans := strings.ToLower(strings.TrimSpace(m.Text)); ans == "да" || ans == "yes" {
+		b.remote.set(g.prefix, "allow")
+		b.replyTo(m, "💾 допуск подтверждён")
+		b.sendRemoteCLI(g.prefix, g.cmd, g.chatID, g.thread, g.origin)
+	} else {
+		b.replyTo(m, "❌ допуск не подтверждён, команда не отправлена")
+	}
+	return true
+}
+
+// sendRemoteCLI уходит протокольной командой TXT_TYPE_CLI_COMMAND с префиксом
+// корреляции xx| (его отражает целевой узел). Без повторов: прошивка шлёт
+// с ts из RTC, повтор выполнил бы команду дважды.
+func (b *Bridge) sendRemoteCLI(prefix [6]byte, cmd string, chatID, thread, origin int64) {
+	if len(cmd)+3 > companion.MaxDMText {
+		b.tg.ReplyToMessage(thread, origin, "❌ команда слишком длинная")
+		return
+	}
+	b.mu.Lock()
+	r := b.r
+	b.mu.Unlock()
+	if r == nil {
+		b.tg.ReplyToMessage(thread, origin, "❌ радио не подключено")
+		return
+	}
+	b.gMu.Lock()
+	b.cmdSeq++
+	cmdID := fmt.Sprintf("%02x", b.cmdSeq)
+	b.gMu.Unlock()
+
+	if err := r.SendContactCommand(prefix, cmdID+"|"+cmd, b.nextTs()); err != nil {
+		log.Printf("cli: $$ %s: %v", cmd, err)
+		b.tg.ReplyToMessage(thread, origin, "❌ "+err.Error())
+		return
+	}
+	log.Printf("cli: $$ %s ушёл по LoRa (%x)", cmd, prefix)
+	timer := time.AfterFunc(remoteCLITimeout, func() {
+		b.gMu.Lock()
+		_, ok := b.inflight[cmdID]
+		delete(b.inflight, cmdID)
+		b.gMu.Unlock()
+		if ok {
+			if err := b.tg.ReplyToMessage(thread, origin, "⏳ ответ не пришёл"); err != nil {
+				log.Printf("telegram: %v", err)
+			}
+		}
+	})
+	b.gMu.Lock()
+	b.inflight[cmdID] = remoteInflight{prefix: prefix, chatID: chatID,
+		thread: thread, origin: origin, timer: timer}
+	b.gMu.Unlock()
+}
+
+// completeRemote закрывает $$-запрос, если это ответ CLI_DATA с нашим
+// префиксом корреляции; true — сообщение обработано.
+func (b *Bridge) completeRemote(m companion.Message) bool {
+	if m.Kind != companion.KindDM || m.TxtType != companion.TxtTypeCLIData {
+		return false
+	}
+	cmdID, rest, ok := strings.Cut(m.Text, "|")
+	if !ok || len(cmdID) != 2 {
+		return false
+	}
+	b.gMu.Lock()
+	in, found := b.inflight[cmdID]
+	if found && in.prefix == m.Prefix {
+		delete(b.inflight, cmdID)
+	} else {
+		found = false
+	}
+	b.gMu.Unlock()
+	if !found {
+		return false
+	}
+	in.timer.Stop()
+	text := strings.TrimSpace(rest)
+	if text == "" {
+		text = "✓ выполнено"
+	}
+	for _, part := range splitText(text, 4000) {
+		if _, err := b.tg.PostInChat(in.chatID, in.thread, in.origin, part); err != nil {
+			log.Printf("telegram: %v", err)
+		}
+	}
+	return true
 }
 
 // approvalPrompt — заявка на разрешение команд от контакта.

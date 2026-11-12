@@ -43,7 +43,6 @@ const (
 
 	pushMsgWaiting = 0x83
 
-	txtTypePlain     = 0
 	maxFrameLen      = 2048
 	ackTimeout       = 15 * time.Second
 	maxGroupChannels = 8
@@ -103,6 +102,13 @@ func (e *RefusedError) Permanent() bool {
 	return false
 }
 
+// Типы текста в DM/канальных фреймах (TxtDataHelpers.h).
+const (
+	TxtTypePlain      = 0 // обычное сообщение
+	TxtTypeCLIData    = 1 // ответ удалённой командной строки
+	TxtTypeCLICommand = 3 // команда удалённой командной строки (v1.18+)
+)
+
 // Kind says what a delivered Message is.
 type Kind uint8
 
@@ -120,6 +126,7 @@ type Message struct {
 	Time       uint32 // mesh epoch seconds
 	SNR        float32
 	HasSNR     bool
+	TxtType    byte // Plain / CLIData / …
 }
 
 // SessionInfo is what the radio exposes after the handshake: every group
@@ -233,7 +240,7 @@ func (c *Client) SendChannelText(idx byte, text string, ts uint32) error {
 	text = Truncate(text, MaxChannelText)
 	payload := make([]byte, 7+len(text))
 	payload[0] = cmdSendChannelTxtMsg
-	payload[1] = txtTypePlain
+	payload[1] = TxtTypePlain
 	payload[2] = idx
 	binary.LittleEndian.PutUint32(payload[3:], ts)
 	copy(payload[7:], text)
@@ -251,10 +258,21 @@ func (c *Client) SendChannelText(idx byte, text string, ts uint32) error {
 // SendContactText sends a DM to a contact by pubkey prefix with the caller's
 // timestamp and waits for the radio's PACKET_SENT ack. Retries must reuse ts.
 func (c *Client) SendContactText(prefix [contactPrefixLen]byte, text string, ts uint32) error {
+	return c.sendContact(prefix, text, ts, TxtTypePlain)
+}
+
+// SendContactCommand шлёт команду удалённой командной строки (TXT_TYPE_CLI_COMMAND)
+// узлу контакта; ответ придёт отдельным DM с TXT_TYPE_CLI_DATA. Повторять
+// нельзя: прошивка шлёт с ts из своего RTC, повтор выполнит команду дважды.
+func (c *Client) SendContactCommand(prefix [contactPrefixLen]byte, text string, ts uint32) error {
+	return c.sendContact(prefix, text, ts, TxtTypeCLICommand)
+}
+
+func (c *Client) sendContact(prefix [contactPrefixLen]byte, text string, ts uint32, txtType byte) error {
 	text = Truncate(text, MaxDMText)
 	payload := make([]byte, 13+len(text))
 	payload[0] = cmdSendTxtMsg
-	payload[1] = txtTypePlain
+	payload[1] = txtType
 	payload[2] = 0 // first attempt
 	binary.LittleEndian.PutUint32(payload[3:], ts)
 	copy(payload[7:13], prefix[:])
@@ -544,7 +562,6 @@ func (c *Client) syncLoop(frames <-chan []byte, deliver func(Message) error) err
 	for f := range frames {
 		isMsg := false
 		var msg Message
-		plain := false
 
 		switch f[0] {
 		case pushMsgWaiting:
@@ -569,7 +586,6 @@ func (c *Client) syncLoop(frames <-chan []byte, deliver func(Message) error) err
 			continue
 		case pktChannelMsgV3:
 			if len(f) > channelMsgV3Text {
-				plain = f[6] == txtTypePlain
 				msg = Message{
 					Kind:       KindChannel,
 					ChannelIdx: f[4],
@@ -577,45 +593,46 @@ func (c *Client) syncLoop(frames <-chan []byte, deliver func(Message) error) err
 					Time:       binary.LittleEndian.Uint32(f[7:11]),
 					SNR:        float32(int8(f[1])) / 4,
 					HasSNR:     true,
+					TxtType:    f[6],
 				}
 			}
 			isMsg = true
 		case pktChannelMsgV2:
 			if len(f) > channelMsgV2Text {
-				plain = f[3] == txtTypePlain
 				msg = Message{
 					Kind:       KindChannel,
 					ChannelIdx: f[1],
 					Text:       trimNUL(f[channelMsgV2Text:]),
 					Time:       binary.LittleEndian.Uint32(f[4:8]),
+					TxtType:    f[3],
 				}
 			}
 			isMsg = true
 		case pktContactMsgV3:
 			if len(f) > contactMsgV3Text {
-				plain = f[11] == txtTypePlain
 				var prefix [contactPrefixLen]byte
 				copy(prefix[:], f[4:10])
 				msg = Message{
-					Kind:   KindDM,
-					Prefix: prefix,
-					Text:   trimNUL(f[contactMsgV3Text:]),
-					Time:   binary.LittleEndian.Uint32(f[12:16]),
-					SNR:    float32(int8(f[1])) / 4,
-					HasSNR: true,
+					Kind:    KindDM,
+					Prefix:  prefix,
+					Text:    trimNUL(f[contactMsgV3Text:]),
+					Time:    binary.LittleEndian.Uint32(f[12:16]),
+					SNR:     float32(int8(f[1])) / 4,
+					HasSNR:  true,
+					TxtType: f[11],
 				}
 			}
 			isMsg = true
 		case pktContactMsgV2:
 			if len(f) > contactMsgV2Text {
-				plain = f[8] == txtTypePlain
 				var prefix [contactPrefixLen]byte
 				copy(prefix[:], f[1:7])
 				msg = Message{
-					Kind:   KindDM,
-					Prefix: prefix,
-					Text:   trimNUL(f[contactMsgV2Text:]),
-					Time:   binary.LittleEndian.Uint32(f[9:13]),
+					Kind:    KindDM,
+					Prefix:  prefix,
+					Text:    trimNUL(f[contactMsgV2Text:]),
+					Time:    binary.LittleEndian.Uint32(f[9:13]),
+					TxtType: f[8],
 				}
 			}
 			isMsg = true
@@ -624,7 +641,9 @@ func (c *Client) syncLoop(frames <-chan []byte, deliver func(Message) error) err
 		}
 
 		if isMsg {
-			if plain && msg.Text != "" {
+			// plain — обычный текст, CLI_DATA — ответ удалённой командной
+			// строки; остальное (CLI_COMMAND без допуска и т.п.) не доставляем
+			if (msg.TxtType == TxtTypePlain || msg.TxtType == TxtTypeCLIData) && msg.Text != "" {
 				if err := deliver(msg); err != nil {
 					log.Printf("telegram: %v", err)
 				}

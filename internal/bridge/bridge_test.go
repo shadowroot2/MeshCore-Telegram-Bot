@@ -23,6 +23,7 @@ type stubRadio struct {
 	mu            sync.Mutex
 	chSent        []string // тексты канальных отправок
 	dmSent        []string // тексты DM
+	cmdSent       []string // команды удалённой командной строки ($$)
 	chNames       map[byte]string
 	chSecrets     map[byte][16]byte
 	setCalls      []string // имена, созданные через SetChannel
@@ -52,6 +53,20 @@ func (s *stubRadio) SendContactText(prefix [6]byte, text string, ts uint32) erro
 	s.dmSent = append(s.dmSent, text)
 	s.sentTs = append(s.sentTs, ts)
 	return s.sendErr
+}
+
+func (s *stubRadio) SendContactCommand(prefix [6]byte, text string, ts uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cmdSent = append(s.cmdSent, text)
+	s.sentTs = append(s.sentTs, ts)
+	return s.sendErr
+}
+
+func (s *stubRadio) cmdTexts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.cmdSent...)
 }
 
 func (s *stubRadio) QueryChannel(idx byte) (string, [16]byte, error) {
@@ -1107,10 +1122,10 @@ func TestPlainDMNotExecuted(t *testing.T) {
 	}
 }
 
-func TestGroupDollarGoesToMesh(t *testing.T) {
-	// "$" в группе (в т.ч. во вкладке ЛС) — обычный текст, не команда
-	r := &stubRadio{}
-	tg := &stubTG{}
+func TestGroupDollarRunsLocalNotMesh(t *testing.T) {
+	// "$" в любой теме — локальный CLI радио бота; в mesh сырой текст не уезжает
+	r := &stubRadio{reply: "> 1.0"}
+	tg := &stubTG{members: map[int64]bool{1: true}}
 	b := newTestBridge(t, tg, r)
 	b.topics.bind("ch:0", 10, "Public")
 
@@ -1123,12 +1138,252 @@ func TestGroupDollarGoesToMesh(t *testing.T) {
 	if next := processUpdates(b, 0, updates); next != 2 {
 		t.Fatalf("offset = %d", next)
 	}
-	if r.cliCount() != 0 {
-		t.Fatalf("group $ must not run CLI, calls=%d", r.cliCount())
+	if r.cliCount() != 1 {
+		t.Fatalf("group $ must run the local CLI, calls=%d", r.cliCount())
 	}
-	ch, _ := r.texts()
-	if len(ch) != 1 || ch[0] != "$ ver" {
-		t.Fatalf("group $ must go to mesh as text: %v", ch)
+	ch, dm := r.texts()
+	if len(ch) != 0 || len(dm) != 0 {
+		t.Fatalf("command must not leak into mesh: ch=%v dm=%v", ch, dm)
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || sent[0].text != "> 1.0" || sent[0].replyTo != 11 {
+		t.Fatalf("quoted result in the topic: %v", sent)
+	}
+}
+
+func TestCommandParsing(t *testing.T) {
+	// "$"+буква — команда; "$$"+буква — удалённая; "$5" — текст
+	for _, c := range []struct{ text, want string }{
+		{"$ ver", "ver"},
+		{"$ver", "ver"},
+		{"$ set name X", "set name X"},
+		{"$$ ver", ""},
+		{"$$ver", ""},
+		{"$5", ""},
+		{"$ 5", ""},
+		{"цена $200", ""},
+	} {
+		if got := cliFrom(c.text); got != c.want {
+			t.Fatalf("cliFrom(%q) = %q, want %q", c.text, got, c.want)
+		}
+	}
+	for _, c := range []struct{ text, want string }{
+		{"$$ ver", "ver"},
+		{"$$ver", "ver"},
+		{"$$ set name X", "set name X"},
+		{"$ ver", ""},
+		{"$$5", ""},
+		{"$$", ""},
+	} {
+		if got := dcliFrom(c.text); got != c.want {
+			t.Fatalf("dcliFrom(%q) = %q, want %q", c.text, got, c.want)
+		}
+	}
+}
+
+func remoteUpdate(id, thread int64, text string) telegram.Update {
+	return telegram.Update{UpdateID: id, Message: &telegram.Message{
+		MessageID: id, Text: text,
+		MessageThreadID: thread, IsTopicMessage: true,
+		Chat: telegram.Chat{ID: -100500, Type: "supergroup"},
+		From: telegram.From{ID: 42, FirstName: "Ю"},
+	}}
+}
+
+func TestRemoteCLIGatedBeforeApproval(t *testing.T) {
+	// $$ к несогласованному контакту: в LoRa ничего не уходит, бот спрашивает
+	// оператора; «да» — допуск сохраняется, команда уходит протокольно
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.adminID = 42
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b.topics.bind("dm:deadbeef0001", 30, "Валера")
+
+	processUpdates(b, 0, []telegram.Update{remoteUpdate(1, 30, "$$ ver")})
+	if got := r.cmdTexts(); len(got) != 0 {
+		t.Fatalf("nothing may go to LoRa before the gate: %v", got)
+	}
+	sent, _, _ := tg.log()
+	ids := tg.ids()
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "Подтверди") {
+		t.Fatalf("gate prompt expected: %v", sent)
+	}
+
+	// «да» на заявку — допуск подтверждён, команда уходит
+	yes := telegram.Update{UpdateID: 2, Message: &telegram.Message{
+		MessageID: 20, Text: "да", MessageThreadID: 30, IsTopicMessage: true,
+		Chat:           telegram.Chat{ID: -100500, Type: "supergroup"},
+		From:           telegram.From{ID: 42, FirstName: "Ю"},
+		ReplyToMessage: &telegram.Message{MessageID: ids[0]},
+	}}
+	processUpdates(b, 2, []telegram.Update{yes})
+	got := r.cmdTexts()
+	if len(got) != 1 || !strings.HasSuffix(got[0], "|ver") {
+		t.Fatalf("CLI_COMMAND must go after approval: %v", got)
+	}
+	if b.remote.get(prefix) != "allow" {
+		t.Fatal("approval must persist in remote.json")
+	}
+}
+
+func TestRemoteCLIDeclined(t *testing.T) {
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.adminID = 42
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b.topics.bind("dm:deadbeef0001", 30, "Валера")
+
+	processUpdates(b, 0, []telegram.Update{remoteUpdate(1, 30, "$$ ver")})
+	sent, _, _ := tg.log()
+	ids := tg.ids()
+
+	no := telegram.Update{UpdateID: 2, Message: &telegram.Message{
+		MessageID: 20, Text: "нет", MessageThreadID: 30, IsTopicMessage: true,
+		Chat:           telegram.Chat{ID: -100500, Type: "supergroup"},
+		From:           telegram.From{ID: 42, FirstName: "Ю"},
+		ReplyToMessage: &telegram.Message{MessageID: ids[0]},
+	}}
+	processUpdates(b, 2, []telegram.Update{no})
+	if got := r.cmdTexts(); len(got) != 0 {
+		t.Fatalf("declined command must not reach LoRa: %v", got)
+	}
+	sent, _, _ = tg.log()
+	if !strings.Contains(sent[len(sent)-1].text, "не подтверждён") {
+		t.Fatalf("decline notice expected: %v", sent)
+	}
+}
+
+func TestRemoteCLIResultQuoted(t *testing.T) {
+	// согласованный контакт: $$ уходит сразу, ответ CLI_DATA с нашим
+	// префиксом приходит цитатой на исходную команду
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.adminID = 42
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b.topics.bind("dm:deadbeef0001", 30, "Валера")
+	b.remote.set(prefix, "allow")
+
+	processUpdates(b, 0, []telegram.Update{remoteUpdate(11, 30, "$$ ver")})
+	got := r.cmdTexts()
+	if len(got) != 1 {
+		t.Fatalf("approved $$ must send at once: %v", got)
+	}
+	cmdID, _, _ := strings.Cut(got[0], "|")
+	if cmdID == "" {
+		t.Fatalf("correlation prefix expected in %q", got[0])
+	}
+
+	reply := companion.Message{Kind: companion.KindDM, Prefix: prefix,
+		TxtType: companion.TxtTypeCLIData, Text: cmdID + "|1.2.3", Time: 2}
+	if err := b.Deliver(reply); err != nil {
+		t.Fatal(err)
+	}
+	sent, _, _ := tg.log()
+	last := sent[len(sent)-1]
+	if last.text != "1.2.3" || last.replyTo != 11 || last.thread != 30 {
+		t.Fatalf("quoted remote reply: %+v", last)
+	}
+
+	// чужой CLI_DATA (без нашего префикса) — обычное сообщение в вкладку
+	stray := companion.Message{Kind: companion.KindDM, Prefix: prefix,
+		TxtType: companion.TxtTypeCLIData, Text: "aa|чужой", Time: 3}
+	if err := b.Deliver(stray); err != nil {
+		t.Fatal(err)
+	}
+	sent, _, _ = tg.log()
+	last = sent[len(sent)-1]
+	if !strings.Contains(last.text, "aa|чужой") || last.replyTo != 0 {
+		t.Fatalf("stray CLI_DATA must post as a plain message: %+v", last)
+	}
+}
+
+func TestRemoteCLITimeout(t *testing.T) {
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.adminID = 42
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b.topics.bind("dm:deadbeef0001", 30, "Валера")
+	b.remote.set(prefix, "allow")
+
+	old := remoteCLITimeout
+	remoteCLITimeout = 30 * time.Millisecond
+	defer func() { remoteCLITimeout = old }()
+
+	processUpdates(b, 0, []telegram.Update{remoteUpdate(11, 30, "$$ ver")})
+	time.Sleep(200 * time.Millisecond)
+	_, replies, _ := tg.log()
+	if len(replies) == 0 {
+		t.Fatal("timeout notice expected")
+	}
+	last := replies[len(replies)-1]
+	if !strings.Contains(last.text, "ответ не пришёл") || last.to != 11 {
+		t.Fatalf("timeout notice expected: %+v", last)
+	}
+}
+
+func TestRemoteCLIOnlyInDMTopicAndForAdmin(t *testing.T) {
+	prefix := [6]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 1}
+	r := &stubRadio{chContacts: map[[6]byte]string{prefix: "Валера"}}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+	b.adminID = 42
+	b.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b.topics.bind("dm:deadbeef0001", 30, "Валера")
+	b.topics.bind("ch:0", 10, "Public")
+	b.remote.set(prefix, "allow")
+
+	// $$ в публичной теме — отказ, в LoRa ничего не уходит
+	processUpdates(b, 0, []telegram.Update{remoteUpdate(1, 10, "$$ ver")})
+	if got := r.cmdTexts(); len(got) != 0 {
+		t.Fatalf("$$ in a channel must not reach LoRa: %v", got)
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "только в личных") {
+		t.Fatalf("refusal expected: %v", sent)
+	}
+
+	// $$ не от ADMIN_ID — отказ
+	notAdmin := remoteUpdate(2, 30, "$$ ver")
+	notAdmin.Message.From.ID = 7
+	processUpdates(b, 2, []telegram.Update{notAdmin})
+	if got := r.cmdTexts(); len(got) != 0 {
+		t.Fatalf("non-admin $$ must not reach LoRa: %v", got)
+	}
+	sent, _, _ = tg.log()
+	if !strings.Contains(sent[len(sent)-1].text, "нет доступа") {
+		t.Fatalf("refusal expected: %v", sent)
+	}
+
+	// без ADMIN_ID в конфиге $$ не работает вовсе
+	b2 := newTestBridge(t, tg, r)
+	b2.info.Contacts = map[[6]byte]string{prefix: "Валера"}
+	b2.topics.bind("dm:deadbeef0001", 30, "Валера")
+	processUpdates(b2, 2, []telegram.Update{remoteUpdate(3, 30, "$$ ver")})
+	if got := r.cmdTexts(); len(got) != 0 {
+		t.Fatalf("$$ without ADMIN_ID must not reach LoRa: %v", got)
+	}
+}
+
+func TestDoubleDollarInPrivateChatRejected(t *testing.T) {
+	r := &stubRadio{reply: "> x"}
+	tg := &stubTG{members: map[int64]bool{42: true}}
+	b := newTestBridge(t, tg, r)
+
+	processUpdates(b, 0, []telegram.Update{privUpdate(42, "$$ ver")})
+	if r.cliCount() != 0 {
+		t.Fatal("$$ in the bot's private chat must not run the local CLI")
+	}
+	sent, _, _ := tg.log()
+	if len(sent) != 1 || !strings.Contains(sent[0].text, "только в личных") {
+		t.Fatalf("refusal expected: %v", sent)
 	}
 }
 

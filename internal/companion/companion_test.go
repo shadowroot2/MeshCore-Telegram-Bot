@@ -153,13 +153,14 @@ func fakeRadio(t *testing.T, conn net.Conn, sent chan<- string, cliReply string,
 	t.Helper()
 	rd := bufio.NewReader(conn)
 	queue := [][]byte{
-		channelMsgV3Frame(0, txtTypePlain, 34, 1700000000, "hello"), // 34/4 = 8.5 dB
-		channelMsgV3Frame(1, txtTypePlain, 34, 1700000000, "wrong channel"),
+		channelMsgV3Frame(0, TxtTypePlain, 34, 1700000000, "hello"), // 34/4 = 8.5 dB
+		channelMsgV3Frame(1, TxtTypePlain, 34, 1700000000, "wrong channel"),
 		channelMsgV3Frame(0, 9, 34, 1700000000, "wrong txt_type"),
-		channelMsgV3Frame(0, txtTypePlain, 20, 1700000001, "world"),
-		channelMsgV2Frame(0, txtTypePlain, 1700000002, "v2 hello"),
-		contactMsgV3Frame(testPrefix, txtTypePlain, 30, 1700000004, "dm hello"),
-		contactMsgV2Frame(testPrefix, txtTypePlain, 1700000005, "dm v2 hello"),
+		channelMsgV3Frame(0, TxtTypePlain, 20, 1700000001, "world"),
+		channelMsgV2Frame(0, TxtTypePlain, 1700000002, "v2 hello"),
+		contactMsgV3Frame(testPrefix, TxtTypePlain, 30, 1700000004, "dm hello"),
+		contactMsgV2Frame(testPrefix, TxtTypePlain, 1700000005, "dm v2 hello"),
+		contactMsgV3Frame(testPrefix, TxtTypeCLIData, 30, 1700000006, "0a|ответ"),
 	}
 	lateSent := false
 
@@ -190,7 +191,11 @@ func fakeRadio(t *testing.T, conn net.Conn, sent chan<- string, cliReply string,
 				text = string(f[13:])
 			}
 			if sent != nil {
-				sent <- "dm:" + text
+				if f[1] == TxtTypeCLICommand {
+					sent <- "cmd:" + text
+				} else {
+					sent <- "dm:" + text
+				}
 			}
 			if stale {
 				writeFrame(t, conn, append([]byte{pktCliReply}, "stale"...))
@@ -223,7 +228,7 @@ func fakeRadio(t *testing.T, conn net.Conn, sent chan<- string, cliReply string,
 			if !lateSent {
 				lateSent = true
 				writeFrame(t, conn, []byte{pushMsgWaiting})
-				queue = append(queue, channelMsgV3Frame(0, txtTypePlain, 34, 1700000003, "late"))
+				queue = append(queue, channelMsgV3Frame(0, TxtTypePlain, 34, 1700000003, "late"))
 			}
 		}
 	}
@@ -310,7 +315,7 @@ func TestSessionDeliversChannelsAndDMs(t *testing.T) {
 		texts = append(texts, m.Text)
 	}
 	// все каналы и DM доставляются: фильтрация — забота роутинга в bridge
-	want := []string{"hello", "wrong channel", "world", "v2 hello", "dm hello", "dm v2 hello", "late"}
+	want := []string{"hello", "wrong channel", "world", "v2 hello", "dm hello", "dm v2 hello", "0a|ответ", "late"}
 	if strings.Join(texts, ",") != strings.Join(want, ",") {
 		t.Fatalf("delivered %v, want %v", texts, want)
 	}
@@ -329,6 +334,9 @@ func TestSessionDeliversChannelsAndDMs(t *testing.T) {
 	}
 	if got[5].Kind != KindDM || got[5].Time != 1700000005 {
 		t.Fatalf("dm v2 metadata: %+v", got[5])
+	}
+	if got[6].TxtType != TxtTypeCLIData {
+		t.Fatalf("CLI_DATA type must survive the wire: %+v", got[6])
 	}
 }
 
@@ -543,5 +551,36 @@ func TestRequestsNotBlockedBySlowDeliver(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("send ack starved by a busy deliver: pump is blocked too")
+	}
+}
+
+func TestSendContactCommandUsesCLIType(t *testing.T) {
+	sent := make(chan string, 4)
+	h := startSession(t, startFakeRadio(t, sent, "> 2", false))
+	c, _ := h.client()
+
+	if err := c.SendContactCommand(testPrefix, "0a|ver", 1700000000); err != nil {
+		t.Fatalf("SendContactCommand: %v", err)
+	}
+	select {
+	case s := <-sent:
+		if s != "cmd:0a|ver" {
+			t.Fatalf("wire must carry TXT_TYPE_CLI_COMMAND: %q", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fake radio never saw the command")
+	}
+
+	// обычный DM остаётся plain
+	if err := c.SendContactText(testPrefix, "текст", 1700000001); err != nil {
+		t.Fatalf("SendContactText: %v", err)
+	}
+	select {
+	case s := <-sent:
+		if s != "dm:текст" {
+			t.Fatalf("plain DM must stay plain: %q", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fake radio never saw the DM")
 	}
 }
