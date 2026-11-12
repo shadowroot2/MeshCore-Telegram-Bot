@@ -1338,3 +1338,35 @@ func TestDMTopicCommands(t *testing.T) {
 		t.Fatalf("command must not send anything over LoRa: %v", dm)
 	}
 }
+
+func TestPermanentRefusalAdvancesOffset(t *testing.T) {
+	r := &stubRadio{}
+	tg := &stubTG{}
+	b := newTestBridge(t, tg, r)
+
+	updates := []telegram.Update{
+		{UpdateID: 7, Message: &telegram.Message{MessageID: 11, Text: "нельзя",
+			Chat: telegram.Chat{ID: -100500}, From: telegram.From{ID: 1, FirstName: "А"}}},
+	}
+
+	// безнадёжный отказ радио (контакт пропал, чужой слот) — сообщение
+	// пропускается, очередь TG->mesh не встаёт навсегда
+	r.sendErr = &companion.RefusedError{Op: "send", Code: 0x02}
+	if next := processUpdates(b, 0, updates); next != 8 {
+		t.Fatalf("offset = %d, want 8: permanent refusal must not block the queue", next)
+	}
+
+	// временный отказ (таблица полна) — как и сетевая ошибка, держит offset
+	r.sendErr = &companion.RefusedError{Op: "send", Code: 0x03}
+	if next := processUpdates(b, 0, updates); next != 0 {
+		t.Fatalf("offset = %d, want 0: transient refusal keeps offset", next)
+	}
+}
+
+func TestTzOffsetZeroIsUTC(t *testing.T) {
+	b := New(&stubTG{}, filepath.Join(t.TempDir(), "topics.json"), 0, 0)
+	_, off := time.Unix(0, 0).In(b.location()).Zone()
+	if off != 0 {
+		t.Fatalf("offset = %d, want 0: TZ_OFFSET=0 это UTC, а не локальное время", off)
+	}
+}

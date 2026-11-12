@@ -443,3 +443,105 @@ func TestTruncateKeepsRunes(t *testing.T) {
 		t.Fatalf("truncate produced %q (%d bytes)", out, len(out))
 	}
 }
+
+// queryOnAttach дёргает QueryChannel прямо из Attach — так живёт bridge
+// (синхронизация вкладок при подключении).
+type queryOnAttach struct {
+	hooksPair
+	name string
+	err  error
+	done chan struct{}
+}
+
+func (h *queryOnAttach) Attach(c *Client, info SessionInfo) {
+	h.hooksPair.Attach(c, info)
+	h.name, _, h.err = c.QueryChannel(0)
+	close(h.done)
+}
+
+func TestAttachCanQueryRadio(t *testing.T) {
+	h := &queryOnAttach{done: make(chan struct{})}
+	go func() {
+		_ = Session(startFakeRadio(t, nil, "> 2", false), "Public", h,
+			func(Message) error { return nil })
+	}()
+	select {
+	case <-h.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("QueryChannel from Attach hung: recv pump starts too late")
+	}
+	if h.err != nil || h.name != "Public" {
+		t.Fatalf("QueryChannel in Attach = %q, %v", h.name, h.err)
+	}
+}
+
+func TestContactsDuringLiveSession(t *testing.T) {
+	h := startSession(t, startFakeRadio(t, nil, "> 2", false))
+	c, _ := h.client()
+
+	type res struct {
+		list map[[6]byte]string
+		err  error
+	}
+	done := make(chan res, 1)
+	go func() {
+		list, err := c.Contacts()
+		done <- res{list, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Contacts during live session: %v", r.err)
+		}
+		if r.list[testPrefix] != "Валера" {
+			t.Fatalf("contacts: %v", r.list)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Contacts() hung during a live session: dump frames are not routed")
+	}
+}
+
+func TestRequestsNotBlockedBySlowDeliver(t *testing.T) {
+	addr := startFakeRadio(t, nil, "> 2", false)
+	busy := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	var once sync.Once
+	deliver := func(m Message) error {
+		if m.Text == "hello" {
+			once.Do(func() {
+				close(busy)
+				<-release
+			})
+		}
+		return nil
+	}
+	h := &hooksPair{}
+	go func() { _ = Session(addr, "Public", h, deliver) }()
+	<-busy // доставка зависла в Telegram
+
+	var c *Client
+	var info SessionInfo
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c, info = h.client()
+		if c != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("session did not attach")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	sent := make(chan error, 1)
+	go func() { sent <- c.SendChannelText(info.DefaultIdx, "while busy", 1700000000) }()
+	select {
+	case err := <-sent:
+		if err != nil {
+			t.Fatalf("SendChannelText: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("send ack starved by a busy deliver: pump is blocked too")
+	}
+}

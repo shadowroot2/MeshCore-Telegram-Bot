@@ -50,6 +50,11 @@ const (
 
 	selfInfoNameOff = 58
 	channelInfoName = 34 // [0x12][idx][32 name][16 secret]
+	// respQueue — глубина очереди ack'ов одного запроса; дамп контактов
+	// приходит серией фреймов, которые помпа складывает сюда без блокировок
+	respQueue = 256
+	// msgsQueue — глубина очереди фреймов сообщений между помпой и syncLoop
+	msgsQueue = 64
 	// V2: [0x08][idx][path][txt_type][ts32][text] — text at 8, unlike V3
 	channelMsgV2Text = 8
 	channelMsgV3Text = 11
@@ -67,6 +72,36 @@ const (
 	MaxChannelText = 169 // 7-byte channel header
 	MaxDMText      = 163 // 13-byte DM header
 )
+
+// Коды ошибок из zephcore/app/CompanionProtocol.h.
+const (
+	errUnsupported = 0x01
+	errNotFound    = 0x02
+	errTableFull   = 0x03
+	errBadState    = 0x04
+	errIllegalArg  = 0x06
+)
+
+// RefusedError — радио явно отклонило запрос (error frame).
+type RefusedError struct {
+	Op   string
+	Code byte
+}
+
+func (e *RefusedError) Error() string {
+	return fmt.Sprintf("radio refused %s: err 0x%02x", e.Op, e.Code)
+}
+
+// Permanent — повтор того же запроса безнадёжен (нет контакта, чужой слот,
+// неподдерживаемый тип). Временные отказы (таблица полна, mesh не готов)
+// остаются на откуп повторам вызывающего.
+func (e *RefusedError) Permanent() bool {
+	switch e.Code {
+	case errUnsupported, errNotFound, errIllegalArg:
+		return true
+	}
+	return false
+}
 
 // Kind says what a delivered Message is.
 type Kind uint8
@@ -141,13 +176,25 @@ func (c *Client) send(payload []byte) error {
 
 // request sends one command frame and waits for a response frame whose opcode
 // is in want (OK/SENT/ERROR/CLI-reply). Frames of other kinds are stale
-// answers to earlier timed-out requests and are dropped rather than handed to
-// the waiter.
+// answers to earlier timed-out requests or the bulk of a dump; the wrapper
+// hands back only the matching frame.
 func (c *Client) request(payload []byte, want ...byte) ([]byte, error) {
+	frames, err := c.requestFrames(payload, want...)
+	if err != nil {
+		return nil, err
+	}
+	return frames[len(frames)-1], nil
+}
+
+// requestFrames sends one command and collects every frame until one of want
+// arrives (that frame is last in the result). Intermediate frames are the
+// bulk of a multi-frame dump (GET_CONTACTS) or stale answers to timed-out
+// requests.
+func (c *Client) requestFrames(payload []byte, want ...byte) ([][]byte, error) {
 	c.reqM.Lock()
 	defer c.reqM.Unlock()
 
-	ack := make(chan []byte, 4)
+	ack := make(chan []byte, respQueue)
 	c.rmu.Lock()
 	c.resp = ack
 	c.rmu.Unlock()
@@ -161,17 +208,19 @@ func (c *Client) request(payload []byte, want ...byte) ([]byte, error) {
 		return nil, err
 	}
 
+	var frames [][]byte
 	deadline := time.After(ackTimeout)
 	for {
 		select {
 		case f := <-ack:
+			frames = append(frames, f)
 			for _, w := range want {
 				if f[0] == w {
-					return f, nil
+					return frames, nil
 				}
 			}
 		case <-deadline:
-			return nil, errors.New("radio ack timeout")
+			return frames, errors.New("radio ack timeout")
 		}
 	}
 }
@@ -270,7 +319,7 @@ func radioErr(what string, f []byte) error {
 	if len(f) > 1 {
 		code = f[1]
 	}
-	return fmt.Errorf("radio refused %s: err 0x%02x", what, code)
+	return &RefusedError{Op: what, Code: code}
 }
 
 func (c *Client) deliverResp(f []byte) {
@@ -328,6 +377,10 @@ func (c *Client) sendSync() error {
 // Session: handshake, resolve channels and contacts, then drain messages
 // (every channel and DM) until the connection dies. Reconnect is the caller's
 // loop. While the session lives, the hooks can push texts back into the mesh.
+//
+// Помпа приёма стартует до хендшейка-резолва и Attach: запросы ждут ack,
+// который маршрутизирует только она. Доставка сообщений идёт отдельным
+// потребителем — медленный deliver (Telegram) не занимает приём ack'ов.
 func Session(addr, defaultChannel string, hooks Hooks, deliver func(Message) error) error {
 	c, err := Dial(addr)
 	if err != nil {
@@ -344,6 +397,15 @@ func Session(addr, defaultChannel string, hooks Hooks, deliver func(Message) err
 		return err
 	}
 	log.Printf("radio: connected to %q", name)
+
+	frames := make(chan []byte, msgsQueue)
+	done := make(chan error, 2)
+	go func() {
+		err := c.pump(frames)
+		close(frames)
+		done <- err
+	}()
+	go func() { done <- c.syncLoop(frames, deliver) }()
 
 	info := SessionInfo{Contacts: map[[contactPrefixLen]byte]string{}}
 	info.NodeName = name
@@ -363,7 +425,7 @@ func Session(addr, defaultChannel string, hooks Hooks, deliver func(Message) err
 	hooks.Attach(c, info)
 	defer hooks.Detach()
 
-	return c.syncLoop(deliver)
+	return <-done
 }
 
 func (c *Client) waitSelfInfo() (string, error) {
@@ -386,39 +448,30 @@ func (c *Client) waitSelfInfo() (string, error) {
 }
 
 // resolveChannels fills info.Channels for every non-empty slot and picks the
-// default channel index by name.
+// default channel index by name. An error frame means the radio has no slot
+// with that index — the scan is over.
 func (c *Client) resolveChannels(info *SessionInfo, defaultName string) error {
 	info.Channels = map[byte]string{}
 	found := false
 	for i := 0; i < maxGroupChannels; i++ {
-		if err := c.send([]byte{cmdGetChannel, byte(i)}); err != nil {
+		f, err := c.request([]byte{cmdGetChannel, byte(i)}, pktChannelInfo, pktError)
+		if err != nil {
 			return err
 		}
-		for {
-			f, err := c.recv()
-			if err != nil {
-				return err
-			}
-			if f[0] == pushMsgWaiting {
-				continue
-			}
-			if f[0] == pktError {
-				// our GET_CHANNEL pointed past the last slot on the radio
-				goto done
-			}
-			if f[0] == pktChannelInfo && len(f) >= channelInfoName {
-				cname := trimNUL(f[2:channelInfoName])
-				if cname != "" {
-					info.Channels[f[1]] = cname
-					if cname == defaultName {
-						info.DefaultIdx, found = f[1], true
-					}
-				}
-				break
+		if f[0] == pktError {
+			break
+		}
+		if len(f) < channelInfoName {
+			return fmt.Errorf("GET_CHANNEL %d: short frame (%d bytes)", i, len(f))
+		}
+		cname := trimNUL(f[2:channelInfoName])
+		if cname != "" {
+			info.Channels[f[1]] = cname
+			if cname == defaultName {
+				info.DefaultIdx, found = f[1], true
 			}
 		}
 	}
-done:
 	if !found {
 		return fmt.Errorf("channel %q not found, radio has %v", defaultName, info.Channels)
 	}
@@ -427,50 +480,68 @@ done:
 
 // Contacts dumps the radio's contact list: pubkey prefix -> name. Имена
 // авто-добавленных контактов появляются только после их advert'ов, поэтому
-// список можно перечитывать в любой момент.
+// список можно перечитывать в любой момент — вызов безопасен и во время
+// живой сессии: ответы маршрутизирует помпа, сокет он не делит ни с кем.
 func (c *Client) Contacts() (map[[contactPrefixLen]byte]string, error) {
-	out := map[[contactPrefixLen]byte]string{}
-	if err := c.send([]byte{cmdGetContacts}); err != nil {
+	frames, err := c.requestFrames([]byte{cmdGetContacts}, pktContactEnd, pktError)
+	if err != nil {
 		return nil, err
 	}
+	out := map[[contactPrefixLen]byte]string{}
+	for _, f := range frames {
+		if f[0] == pktError {
+			return nil, radioErr("GET_CONTACTS", f)
+		}
+		if f[0] == pktContact && len(f) >= contactFrameMin {
+			var prefix [contactPrefixLen]byte
+			copy(prefix[:], f[contactPrefixOff:contactPrefixOff+contactPrefixLen])
+			out[prefix] = trimNUL(f[contactNameOff : contactNameOff+32])
+		}
+	}
+	return out, nil
+}
+
+// isRespFrame — фреймы-ответы на запросы клиент → радио. Их маршрутизирует
+// помпа ожидающему запросчику; всё остальное — поток сообщений и sync-управление.
+func isRespFrame(op byte) bool {
+	switch op {
+	case pktOK, pktError, pktSent, pktCliReply, pktChannelInfo,
+		pktContactStart, pktContact, pktContactEnd:
+		return true
+	}
+	return false
+}
+
+// pump — единственный читатель сокета: ответы на запросы уходят ожидающему
+// запросчику (deliverResp), всё остальное — в канал фреймов syncLoop. Помпа
+// не должна делать ничего, кроме чтения сокета и записи в канал, иначе
+// живые запросы (отправка, CLI, GET_CONTACTS) начинают ловить ack timeout.
+func (c *Client) pump(out chan<- []byte) error {
 	for {
 		f, err := c.recv()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		switch f[0] {
-		case pushMsgWaiting:
+		if isRespFrame(f[0]) {
+			c.deliverResp(f)
 			continue
-		case pktError:
-			return nil, radioErr("GET_CONTACTS", f)
-		case pktContact:
-			if len(f) >= contactFrameMin {
-				var prefix [contactPrefixLen]byte
-				copy(prefix[:], f[contactPrefixOff:contactPrefixOff+contactPrefixLen])
-				out[prefix] = trimNUL(f[contactNameOff : contactNameOff+32])
-			}
-		case pktContactEnd:
-			return out, nil
 		}
+		out <- f
 	}
 }
 
 // syncLoop: radio pushes MSG_WAITING, we pull with SYNC_NEXT_MESSAGE until
 // NO_MORE_MSGS. A push seen mid-drain sets resync — the new message may have
 // landed behind the iterator, so one more drain is kicked at the end.
-func (c *Client) syncLoop(deliver func(Message) error) error {
+// Доставка сообщений идёт здесь; ack'и параллельно разносит помпа.
+func (c *Client) syncLoop(frames <-chan []byte, deliver func(Message) error) error {
 	syncing := true
 	resync := false
 	if err := c.sendSync(); err != nil {
 		return err
 	}
 
-	for {
-		f, err := c.recv()
-		if err != nil {
-			return err
-		}
-
+	for f := range frames {
 		isMsg := false
 		var msg Message
 		plain := false
@@ -485,9 +556,6 @@ func (c *Client) syncLoop(deliver func(Message) error) error {
 					return err
 				}
 			}
-			continue
-		case pktOK, pktError, pktSent, pktCliReply, pktChannelInfo:
-			c.deliverResp(f)
 			continue
 		case pktNoMoreMsgs:
 			syncing = false
@@ -568,6 +636,7 @@ func (c *Client) syncLoop(deliver func(Message) error) error {
 			}
 		}
 	}
+	return errors.New("radio connection closed")
 }
 
 func trimNUL(b []byte) string {

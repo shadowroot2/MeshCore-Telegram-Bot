@@ -97,13 +97,15 @@ func (a *admins) get(prefix [6]byte) string {
 }
 
 func (a *admins) set(prefix [6]byte, state string) {
+	// запись под мьютексом: конкурентные set не должны терять чужие записи
+	// при копировании снимка вне блокировки
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.state[fmt.Sprintf("%x", prefix)] = state
 	raw := make(map[string]string, len(a.state))
 	for k, v := range a.state {
 		raw[k] = v
 	}
-	a.mu.Unlock()
 	if data, err := json.Marshal(raw); err == nil {
 		if err := os.WriteFile(a.path, data, 0o600); err != nil {
 			log.Printf("admins: save %s: %v", a.path, err)
@@ -131,10 +133,11 @@ type topicEntry struct {
 }
 
 type topics struct {
-	mu    sync.Mutex
-	path  string
-	byKey map[string]topicEntry
-	byID  map[int64]string
+	mu       sync.Mutex
+	ensureMu sync.Mutex // сериализует создание вкладок (check-and-create)
+	path     string
+	byKey    map[string]topicEntry
+	byID     map[int64]string
 }
 
 func loadTopics(path string) *topics {
@@ -202,35 +205,29 @@ func isNotFound(err error) bool {
 // invalidate выбрасывает маппинг удалённой вкладки.
 func (t *topics) invalidate(key string) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	if e, ok := t.byKey[key]; ok {
 		delete(t.byID, e.ID)
 		delete(t.byKey, key)
 	}
-	raw := make(map[string]topicEntry, len(t.byKey))
-	for k, e := range t.byKey {
-		raw[k] = e
-	}
-	t.mu.Unlock()
-
-	data, err := json.Marshal(raw)
-	if err == nil {
-		err = os.WriteFile(t.path, data, 0o600)
-	}
-	if err != nil {
-		log.Printf("topics: save %s: %v", t.path, err)
-	}
+	t.saveLocked()
 }
 
 func (t *topics) bind(key string, thread int64, name string) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.byKey[key] = topicEntry{ID: thread, Name: name}
 	t.byID[thread] = key
+	t.saveLocked()
+}
+
+// saveLocked пишет topics.json; зовётся с t.mu, чтобы конкурентные bind/
+// invalidate не перетирали файл чужими снимками.
+func (t *topics) saveLocked() {
 	raw := make(map[string]topicEntry, len(t.byKey))
 	for k, e := range t.byKey {
 		raw[k] = e
 	}
-	t.mu.Unlock()
-
 	data, err := json.Marshal(raw)
 	if err == nil {
 		err = os.WriteFile(t.path, data, 0o600)
@@ -253,6 +250,10 @@ func isFallbackName(name string) bool {
 // вкладка уже существует под другим именем (например dm-xxxx до того, как
 // стал известен контакт) — она переименовывается.
 func (t *topics) ensure(key, name string, tg Telegram) int64 {
+	// check-and-create под общим замком: два потока не должны создать
+	// две вкладки на один ключ
+	t.ensureMu.Lock()
+	defer t.ensureMu.Unlock()
 	t.mu.Lock()
 	e, ok := t.byKey[key]
 	t.mu.Unlock()
@@ -311,10 +312,9 @@ type Bridge struct {
 }
 
 func New(tg Telegram, topicsFile string, tzHours float64, adminID int64) *Bridge {
-	loc := time.Local
-	if tzHours != 0 {
-		loc = time.FixedZone(fmt.Sprintf("UTC%+g", tzHours), int(tzHours*3600))
-	}
+	// TZ_OFFSET=0 — это UTC, а не «взять локальный»: конфиг всегда даёт
+	// явный сдвиг (по умолчанию +5)
+	loc := time.FixedZone(fmt.Sprintf("UTC%+g", tzHours), int(tzHours*3600))
 	return &Bridge{
 		tg:      tg,
 		topics:  loadTopics(topicsFile),
@@ -377,14 +377,18 @@ func (b *Bridge) syncTopics() {
 	b.bindExistingTopics()
 
 	b.mu.Lock()
+	r := b.r
 	channels := make(map[byte]string, len(b.info.Channels))
 	for idx, name := range b.info.Channels {
 		channels[idx] = name
 	}
 	b.mu.Unlock()
+	if r == nil {
+		return
+	}
 
 	for idx, name := range channels {
-		if _, secret, err := b.r.QueryChannel(idx); err == nil {
+		if _, secret, err := r.QueryChannel(idx); err == nil {
 			b.normalizePublicChannel(idx, name, secret)
 		}
 		b.topics.ensure(channelKey(idx), name, b.tg)
@@ -739,6 +743,14 @@ func (b *Bridge) sendTo(t target, text string, ts uint32) error {
 	return r.SendChannelText(t.channel, text, ts)
 }
 
+// isPermanentRefusal — радио отклонило запрос безнадёжно: повтор байт-в-байт
+// того же пакета результата не даст. Временные отказы (таблица полна) и
+// сетевые ошибки сюда не попадают — их лечит повтор.
+func isPermanentRefusal(err error) bool {
+	var ref *companion.RefusedError
+	return errors.As(err, &ref) && ref.Permanent()
+}
+
 // tssFor выдаёт стабильные timestamp'ы для сообщения: при повторе (offset не
 // сдвинулся) текст уходит с теми же ts — пакет байт-в-байт тот же, и mesh
 // дедуплицирует его, вместо дублей у получателей.
@@ -894,7 +906,15 @@ func processUpdates(b *Bridge, offset int64, updates []telegram.Update) int64 {
 		}
 		tss := b.tssFor(u.UpdateID, len(chunks))
 		for i, chunk := range chunks {
-			if err := b.sendTo(tgt, chunk, tss[i]); err != nil {
+			err := b.sendTo(tgt, chunk, tss[i])
+			if isPermanentRefusal(err) {
+				// радио само отказалось (нет контакта, чужой слот): повтор
+				// того же запроса бесполезен — пропускаем, чтобы не вешать
+				// очередь TG->mesh навсегда
+				log.Printf("mesh: %v, dropping %q", err, chunk)
+				continue
+			}
+			if err != nil {
 				// offset остаётся: Telegram доставит сообщение повторно,
 				// а повтор пойдёт с теми же ts — mesh схлопнет дубли
 				log.Printf("mesh: %v, will retry %q", err, chunk)
